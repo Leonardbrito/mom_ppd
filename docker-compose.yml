@@ -1,0 +1,14 @@
+# Broker MOM do projeto: RabbitMQ (porta 5672 = AMQP, 15672 = painel web)
+# Subir:  docker compose up -d      Painel: http://localhost:15672 (guest/guest)
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: mom_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12

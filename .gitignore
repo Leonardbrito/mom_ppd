@@ -1,0 +1,33 @@
+# Ambiente virtual (recriar com: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt)
+.venv/
+venv/
+env/
+
+# Bytecode / caches do Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Arquivo de teste gerado por gerar_arquivo.py (~2 MB; recriar com:
+#   ./.venv/bin/python scripts/gerar_arquivo.py 200000 data/entrada.txt)
+data/*
+!data/.gitkeep
+
+# Logs e saídas geradas
+*.log
+
+# Variáveis de ambiente / segredos locais
+.env
+.env.*
+
+# Editores e IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
