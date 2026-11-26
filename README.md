@@ -4,560 +4,17 @@ Workflow de computação paralela com **MOM (RabbitMQ)** em Python: dois leitore
 (pares/ímpares) alimentam uma **fila**; N workers consomem a fila, contam as palavras-chave e
 publicam o resultado num **tópico**; o dashboard assina o tópico e atualiza os totais em tempo real.
 
-## Como rodar
-
-```bash
-# 1) broker (precisa do Docker)
-docker compose up -d
-
-# 2) dependências (uma vez)
-python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt   # tkinter vem com o Python (Ubuntu: sudo apt install python3-tk)
-
-# 3) arquivo de teste (opcional) e aplicação
-./.venv/bin/python scripts/gerar_arquivo.py 200000 data/entrada.txt
-./.venv/bin/python src/cliente.py            # interface gráfica
-```
-
-### Ativando a venv (opcional)
-
-Os comandos acima chamam `./.venv/bin/python` direto e funcionam sem ativar nada. Se preferir
-digitar só `python`, ative a venv uma vez por terminal:
-
-```bash
-source .venv/bin/activate      # Linux/macOS (o prompt passa a mostrar "(.venv)")
-# .venv\Scripts\activate       # Windows
-
-python scripts/gerar_arquivo.py 200000 data/entrada.txt
-python src/cliente.py
-
-deactivate                     # para sair da venv
-```
-
-Sem interface (útil para testar): `python src/cliente.py --cli -a data/entrada.txt -p python,java,erro -w 3`.
-Painel do broker: http://localhost:15672 (guest/guest). Outro host: variável `RABBITMQ_HOST`.
-
-## O arquivo de entrada: `scripts/gerar_arquivo.py`
-
-[gerar_arquivo.py](scripts/gerar_arquivo.py) é um **script auxiliar**, separado do sistema: **não
-usa o RabbitMQ**. Ele faz duas coisas:
-
-1. **Gera um arquivo de texto grande** para servir de entrada para a contagem.
-2. **Imprime um gabarito**, isto é, quantas vezes algumas palavras aparecem no arquivo, para conferir
-   se o dashboard acertou.
-
-```bash
-python scripts/gerar_arquivo.py 200000 data/entrada.txt
-#                               ^^^^^^ ^^^^^^^^^^^^^^^^
-#                               linhas  arquivo de saída (os dois são opcionais)
-```
-
-### Como ele funciona
-
-1. **Vocabulário fixo de 26 palavras**, todas do tema do trabalho
-   ([linhas 15-17](scripts/gerar_arquivo.py#L15-L17)): `python java erro sucesso fila topico broker
-   mensagem worker leitor dashboard paralelo processo thread rede servidor cliente dados arquivo
-   linha palavra contador sistema distribuido middleware evento`.
-2. **Sorteador com semente fixa** ([linha 23](scripts/gerar_arquivo.py#L23)):
-   `rnd = random.Random(42)`.
-3. **Cada linha tem de 5 a 20 palavras sorteadas** do vocabulário, com a primeira letra maiúscula e
-   um ponto no fim ([linhas 27-29](scripts/gerar_arquivo.py#L27-L29)).
-4. **Ao mesmo tempo que escreve, ele conta as palavras** com um `Counter`, sem broker e sem
-   paralelismo ([linha 30](scripts/gerar_arquivo.py#L30)).
-5. **No fim, imprime o gabarito** ([linhas 31-32](scripts/gerar_arquivo.py#L31-L32)).
-
-Exemplo com 3 linhas:
-
-```
-$ python scripts/gerar_arquivo.py 3 data/exemplo.txt
-3 linhas gravadas em data/exemplo.txt
-Contagem de referência: {'python': 2, 'java': 1, 'erro': 1, 'middleware': 0}
-
-$ cat data/exemplo.txt
-Python distribuido worker mensagem mensagem fila distribuido sucesso.
-Arquivo thread java python erro broker mensagem.
-Dados broker sistema palavra sistema.
-```
-
-### Por que ele gera sempre o mesmo arquivo
-
-O computador não sorteia de verdade. Ele usa uma fórmula que, a partir de um número inicial (a
-**semente**, aqui `42`), produz uma sequência que *parece* aleatória. Com a mesma semente, a
-sequência é sempre a mesma.
-
-Na prática:
-
-- **Mesmo número de linhas** → **exatamente o mesmo arquivo**, byte a byte.
-- **Mais linhas** → as primeiras continuam iguais, e o arquivo só fica mais comprido.
-
-Isso torna os testes **repetíveis**. Você pode rodar com 1 worker e depois com 3 sobre o mesmo
-arquivo para comparar o tempo, e sabe de antemão quais números o dashboard deve mostrar. Para gerar
-um arquivo diferente, troque o `42` por outro número, ou use `random.Random()` sem número.
-
-### Como usar o gabarito
-
-Conte `python, java, erro, middleware` no arquivo gerado. Os totais do dashboard têm que ser
-**iguais** à contagem de referência. Se forem, fica provado que, ao passar por leitores → fila →
-workers → tópico → dashboard:
-
-- **nenhuma linha se perdeu**;
-- **nenhuma linha foi contada duas vezes**, mesmo com o trabalho dividido entre vários workers.
-
-A maiúscula do início da linha ("Python") e o ponto no fim ("sucesso.") não atrapalham: o worker
-conta sem diferenciar maiúsculas e minúsculas e só considera palavras inteiras
-([config.py#L82-L87](src/config.py#L82-L87)).
-
-## Docker e pika: como os programas falam com o RabbitMQ
-
-**Resumo:** o **Docker** roda o RabbitMQ, que é o broker. O **pika** é a biblioteca Python que os
-programas usam para falar com ele. **Só o RabbitMQ roda no Docker**: cliente, leitores, workers e
-dashboard rodam direto no computador, pela venv, e se conectam ao broker pela porta 5672.
-
-```
- Seu computador                                         Container Docker "mom_rabbitmq"
- ┌──────────────────────────────────┐                  ┌───────────────────────────────┐
- │ cliente.py   ─┐                  │                  │                               │
- │ leitor.py ×2 ─┤ pika             │   localhost:5672 │   RabbitMQ (broker)           │
- │ worker.py ×3 ─┼─────────────────────────────────────▶   fila_linhas                 │
- │ dashboard.py ─┘     (AMQP)       │                  │   topico_palavras             │
- │                                  │                  │   dashboard.<run>             │
- │ navegador ──────────────────────────────────────────▶   painel web                  │
- │                                  │  localhost:15672 │                               │
- └──────────────────────────────────┘                  └───────────────────────────────┘
-```
-
-### Docker: o broker num container
-
-Todo o Docker do projeto está no [docker-compose.yml](docker-compose.yml):
-
-```yaml
-services:
-  rabbitmq:
-    image: rabbitmq:3-management
-    container_name: mom_rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-```
-
-| Linha | O que faz |
-|---|---|
-| `image: rabbitmq:3-management` | Usa a imagem oficial do RabbitMQ versão 3. O sufixo `-management` traz o **painel web**. |
-| `container_name: mom_rabbitmq` | Dá um nome fixo ao container, para usar em `docker ps` e `docker exec`. |
-| `ports: "5672:5672"` | Liga a porta 5672 **do computador** à porta 5672 **do container**. É a porta do protocolo **AMQP**, por onde o pika conversa com o broker. |
-| `ports: "15672:15672"` | O mesmo para o painel web (http://localhost:15672, usuário e senha `guest`). |
-| `healthcheck` | A cada 5 s, o Docker roda `rabbitmq-diagnostics ping` dentro do container para saber se o broker já responde. Depois disso, o container aparece como **healthy**. |
-
-**Por que usar Docker:**
-
-- **Nada a instalar:** o RabbitMQ é escrito em Erlang. Sem Docker, seria preciso instalar e
-  configurar o Erlang e o RabbitMQ. Com Docker, basta um comando.
-- **Mesma versão para todos:** você, os colegas e o professor rodam o mesmo broker.
-- **Fácil de limpar:** `docker compose down` remove tudo, sem deixar resto no sistema.
-
-**Comandos do dia a dia:**
-
-```bash
-docker compose up -d        # sobe o broker em segundo plano (-d = detached)
-docker compose ps           # mostra o status; espere aparecer "healthy"
-docker compose logs -f      # acompanha os logs do RabbitMQ (Ctrl+C para sair)
-docker compose stop         # para o container, mas mantém filas e mensagens
-docker compose down         # para E APAGA o container (perde filas e mensagens)
-
-# olhar dentro do broker pelo terminal, sem o painel:
-docker exec mom_rabbitmq rabbitmqctl list_queues name messages consumers
-```
-
-**Dois cuidados:**
-
-1. **Espere o broker ficar pronto.** O RabbitMQ leva alguns segundos para subir. Se o cliente for
-   aberto cedo demais, aparece "Não foi possível conectar ao RabbitMQ…"
-   ([cliente.py#L54-L59](src/cliente.py#L54-L59)). Rode `docker compose ps` e espere o **healthy**.
-2. **A persistência tem limite.** A `fila_linhas` é durável e as mensagens são persistentes, então
-   elas sobrevivem a um **reinício** do broker (`docker compose stop` e depois `up`). Mas o
-   `docker-compose.yml` não tem **volume**: os dados ficam dentro do container, e um
-   `docker compose down` apaga tudo. Para sobreviver à remoção do container, seria preciso montar um
-   volume em `/var/lib/rabbitmq`.
-
-### pika: a biblioteca que fala com o broker
-
-O **pika** (única dependência do [requirements.txt](requirements.txt)) é um **cliente** do
-protocolo AMQP, o protocolo que o RabbitMQ fala. Não confunda: o MOM é o RabbitMQ, e o pika só
-envia e recebe mensagens dele.
-
-**Conexão e canal.** Tudo começa em [config.py#L32-L41](src/config.py#L32-L41):
-
-```python
-def conectar():
-    params = pika.ConnectionParameters(
-        host=BROKER_HOST,                 # "localhost", a porta que o Docker expõe
-        port=BROKER_PORT,                 # 5672
-        credentials=pika.PlainCredentials(BROKER_USER, BROKER_PASS),   # guest/guest
-        heartbeat=60,                     # sinal periódico para detectar conexão morta
-        blocked_connection_timeout=300,
-    )
-    return pika.BlockingConnection(params)
-```
-
-E cada programa faz:
-
-```python
-conn = config.conectar()     # 1 conexão TCP com o broker
-canal = conn.channel()       # 1 canal dentro dela; todas as operações passam pelo canal
-```
-
-- **`BlockingConnection`** é a conexão **bloqueante** (síncrona): cada chamada espera a resposta do
-  broker antes de seguir. É a forma mais simples de usar o pika.
-- **Canal** é uma "conversa" dentro da conexão TCP. O projeto usa 1 canal por conexão. É isso que
-  aparece nas abas *Connections* e *Channels* do painel.
-- O endereço vem de variáveis de ambiente ([config.py#L23-L26](src/config.py#L23-L26)), com
-  `localhost` como padrão. Com `RABBITMQ_HOST=<ip>`, os programas usam o broker de outra máquina,
-  sem mudar o código.
-
-**As chamadas do pika usadas no projeto:**
-
-| Chamada | Para que serve | Onde |
-|---|---|---|
-| `queue_declare` | cria a fila, se ainda não existir (é **idempotente**) | [config.py#L46](src/config.py#L46), [config.py#L64](src/config.py#L64) |
-| `exchange_declare` | cria o tópico (exchange do tipo `topic`) | [config.py#L47](src/config.py#L47) |
-| `queue_bind` | liga a fila do dashboard ao tópico com o padrão `*.<run>` | [config.py#L65](src/config.py#L65) |
-| `BasicProperties(delivery_mode=2)` | marca a mensagem como persistente (gravada em disco) | [leitor.py#L35](src/leitor.py#L35) |
-| `basic_publish` | **publica** uma mensagem numa exchange | [leitor.py#L48](src/leitor.py#L48), [config.py#L70](src/config.py#L70) |
-| `basic_qos` | define o **prefetch**: quantas mensagens sem ack o consumidor aceita | [worker.py#L28](src/worker.py#L28), [dashboard.py#L97](src/dashboard.py#L97) |
-| `basic_consume` | registra o **callback** que recebe as mensagens de uma fila | [worker.py#L43](src/worker.py#L43), [dashboard.py#L98](src/dashboard.py#L98) |
-| `start_consuming` | entra no laço que espera mensagens e chama o callback | [worker.py#L46](src/worker.py#L46), [dashboard.py#L99](src/dashboard.py#L99) |
-| `basic_ack` | **confirma** que a mensagem foi processada; só então o broker a apaga | [worker.py#L41](src/worker.py#L41), [dashboard.py#L113](src/dashboard.py#L113) |
-| `stop_consuming` / `queue_delete` | encerra o consumo e apaga a fila do dashboard | [dashboard.py#L119-L122](src/dashboard.py#L119-L122) |
-| `add_callback_threadsafe` | pede, de outra thread, que a thread do pika execute uma função | [dashboard.py#L124](src/dashboard.py#L124) |
-
-**O callback.** O pika chama a função registrada em `basic_consume` a cada mensagem, sempre com
-quatro argumentos ([worker.py#L32](src/worker.py#L32)):
-
-```python
-def ao_receber(ch, metodo, props, corpo):
-    msg = json.loads(corpo)                          # corpo chega em BYTES → JSON → dict
-    ...
-    ch.basic_ack(delivery_tag=metodo.delivery_tag)   # metodo traz o delivery_tag e a routing_key
-```
-
-| Argumento | O que é |
-|---|---|
-| `ch` | o canal, usado para publicar e dar ack de dentro do callback |
-| `metodo` | dados da entrega: `delivery_tag` (o "número" da entrega, usado no ack) e `routing_key` (o dashboard usa para saber o tipo da mensagem) |
-| `props` | propriedades da mensagem, como `delivery_mode` (o projeto não usa) |
-| `corpo` | o conteúdo, em **bytes**. Por isso se publica com `json.dumps(...).encode("utf-8")` e se lê com `json.loads(corpo)` |
-
-**O pika não é thread-safe.** Uma `BlockingConnection` só pode ser usada pela thread que a criou. Por
-isso, no dashboard, **só a thread `Assinante` fala com o broker**. A interface recebe os dados por
-uma `queue.Queue`, e para encerrar usa `add_callback_threadsafe`, que pede à própria thread do pika
-para parar ([dashboard.py#L115-L126](src/dashboard.py#L115-L126)).
-
-## Arquitetura (numeração do diagrama do enunciado)
-
-| # | Componente | Arquivo | Papel no MOM |
-|---|---|---|---|
-| 1 | Cliente | `src/cliente.py` | pede arquivo/palavras, sobe workers, dashboard e os 2 leitores |
-| 2 | Leitor de linhas (par e ímpar) | `src/leitor.py` | **Produtor** da fila |
-| 3 | Fila de linhas | `fila_linhas` (RabbitMQ) | fila durável, entrega round-robin |
-| 4 | Contador de palavras (workers) | `src/worker.py` | **Consumidor** da fila + **Publisher** do tópico |
-| 5 | Tópico de palavras | exchange `topico_palavras` (tipo *topic*) | publish/subscribe |
-| 6 | Dashboard | `src/dashboard.py` | **Subscriber** do tópico |
-
-`src/config.py` concentra a conexão e a topologia; `scripts/gerar_arquivo.py` cria o arquivo de teste.
-
-### Fluxo de mensagens
-
-1. Cliente cria a fila `dashboard.<run>` já ligada ao tópico (`*.<run>`) e publica `inicio.<run>`
-   (arquivo + palavras). Isso vem *antes* dos leitores porque o tópico não guarda mensagens:
-   sem a fila pré-criada, o dashboard poderia perder as primeiras contagens.
-2. Cada leitor lê o arquivo em streaming, e para cada linha da sua paridade publica
-   `{run_id, linha, texto, palavras}` em `fila_linhas`. Linhas numeradas a partir de 1
-   (ímpar = 1, 3, 5…; par = 2, 4, 6…).
-3. Os workers (competing consumers) pegam linhas da fila, contam cada palavra-chave
-   (palavra inteira, sem diferenciar maiúsculas/minúsculas), publicam `contagem.<run>` com
-   `{linha, contagem, worker}` e só então dão **ack**. Se um worker morrer antes do ack, a
-   linha volta para a fila e outro a processa (entrega *at-least-once*).
-4. Ao terminar, cada leitor publica `leitor_fim.<run>` com quantas linhas enviou. O dashboard soma
-   os dois totais e sabe que acabou quando `linhas processadas == linhas enviadas`.
-5. O dashboard soma as contagens, mostra barras por palavra, progresso, linhas/s e quantas linhas
-   cada worker processou (evidência do paralelismo).
-
-### Decisões de projeto (para a explicação do código)
-
-- **Por que fila e tópico?** A fila distribui *trabalho* (cada linha vai para **um** worker); o
-  tópico distribui *informação* (todo assinante interessado recebe). É a diferença entre os dois
-  modelos de MOM pedidos no enunciado.
-- **Mensagens persistentes + fila durável** e **ack manual** garantem que nenhuma linha se perde.
-- **`prefetch`=100** nos workers: cada um recebe um lote de linhas por vez, em vez de uma ida ao
-  broker por linha.
-- **Threads no dashboard:** o pika `BlockingConnection` não é thread-safe; só a thread assinante
-  fala com o broker e entrega os dados à interface (tkinter) por uma `queue.Queue`.
-- **Isolamento por `run_id`:** resultados de execuções antigas não se misturam com a atual.
-
-### Limitações conhecidas
-
-- Com entrega *at-least-once*, uma falha de worker entre publicar e dar ack pode contar uma linha
-  duas vezes (raro; dedupe por número de linha exigiria guardar todos os números no dashboard).
-- Palavras são comparadas literalmente: "ação" ≠ "acao".
-
----
-
-## Como funciona o paralelismo
-
-**Resposta curta:** cada worker é um **processo** separado, e todos consomem a **mesma fila**. O
-broker entrega cada linha a um único worker, então N workers contam N lotes de linhas **ao mesmo
-tempo**, em núcleos diferentes da CPU. Nenhum código do projeto divide o trabalho: quem divide é o
-RabbitMQ.
-
-O paralelismo vem de três mecanismos que trabalham juntos.
-
-### 1. Processos, não threads
-
-O cliente abre cada worker como um **processo** do sistema operacional
-([cliente.py#L37-L41](src/cliente.py#L37-L41)):
-
-```python
-for i in range(len(self.workers), n):
-    self.workers.append(_py("worker.py", "--id", str(i + 1), ...))   # _py = subprocess.Popen
-```
-
-**Por que processos?** Por causa do **GIL** do Python (veja [o que é GIL](#contexto-o-que-é-gil)).
-Dentro de um processo, só uma thread executa código Python por vez. Contar palavras com regex é
-trabalho de CPU, então 3 threads se revezariam num núcleo só. Já 3 processos têm 3 interpretadores
-e 3 GILs, e o sistema operacional os coloca em 3 núcleos ao mesmo tempo.
-
-```
- Threads (não usado)                 Processos (usado)
- ┌──────── 1 processo ────────┐      ┌─ processo ─┐ ┌─ processo ─┐ ┌─ processo ─┐
- │  GIL: uma thread por vez   │      │  worker-1  │ │  worker-2  │ │  worker-3  │
- │  T1 ▓▓░░░░▓▓░░░░           │      │  ▓▓▓▓▓▓▓▓  │ │  ▓▓▓▓▓▓▓▓  │ │  ▓▓▓▓▓▓▓▓  │
- │  T2 ░░▓▓░░░░▓▓░░           │      │  núcleo 1  │ │  núcleo 2  │ │  núcleo 3  │
- │  T3 ░░░░▓▓░░░░▓▓           │      └────────────┘ └────────────┘ └────────────┘
- └────────────────────────────┘
-```
-
-### 2. Competing consumers: o broker divide o trabalho
-
-Todos os workers fazem `basic_consume` na **mesma fila** ([worker.py#L43](src/worker.py#L43)):
-
-```python
-canal.basic_consume(queue=config.FILA_LINHAS, on_message_callback=ao_receber)
-```
-
-Quando vários consumidores leem a mesma fila, o RabbitMQ entrega **cada mensagem a um só deles**,
-revezando (*round-robin*). Esse padrão se chama **competing consumers** (consumidores concorrentes):
-os workers "competem" pelas linhas. Por isso:
-
-- **nenhum worker sabe dos outros**, e não há código de divisão, índice ou coordenação;
-- para ter mais paralelismo, **basta abrir mais workers**, sem mudar nada no código;
-- se um worker morrer, os outros continuam, e as linhas que ele não confirmou (ack) voltam para a
-  fila.
-
-### 3. Prefetch: lotes em vez de uma linha por vez
-
-```python
-canal.basic_qos(prefetch_count=100)     # worker.py#L28
-```
-
-O prefetch diz ao broker: "mande até **100 linhas sem ack** para este worker". Isso tem dois
-efeitos:
-
-- **Menos idas e vindas:** o worker já tem as próximas linhas na mão, em vez de pedir uma por uma
-  pela rede.
-- **Divisão justa:** o broker só manda mais linhas quando o worker confirma as anteriores. Um worker
-  mais lento recebe menos, e os mais rápidos pegam o resto. A carga se ajusta sozinha.
-
-Sem `basic_qos`, o broker repartiria as linhas num rodízio cego: cada worker receberia a mesma
-quantidade, fosse rápido ou lento, e todas as linhas se acumulariam na memória dos workers. Os
-detalhes estão em [Round-robin](#round-robin-como-o-broker-reparte-as-linhas).
-
-A demo deve usar um **arquivo grande**. Na primeira execução, os workers são abertos junto com os
-leitores, e o primeiro worker a se conectar já pode levar 100 linhas de uma vez. Com um arquivo
-pequeno, ele pode fazer quase tudo sozinho, e a demo parece não ter paralelismo.
-
-### Além dos workers: as etapas também rodam ao mesmo tempo
-
-Os leitores, os workers e o dashboard são processos separados, e as linhas passam pela fila como
-numa **linha de montagem**. Ninguém espera a etapa anterior terminar:
-
-```
-tempo ─────────────────────────────────────────────────────────▶
-leitor ímpar  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-leitor par    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-worker-1        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-worker-2        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-worker-3        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-dashboard         ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
-```
-
-Enquanto os leitores ainda leem o fim do arquivo, os workers já contam as primeiras linhas e o
-dashboard já está somando.
-
-### Por que o resultado sai certo, mesmo fora de ordem
-
-Os workers terminam as linhas em **qualquer ordem**: a linha 7 pode chegar ao dashboard antes da
-linha 2. Isso não importa, porque o dashboard só **soma**, e a ordem das parcelas não muda a soma.
-O número da linha vai na mensagem só para rastreio.
-
-O que importa é que **cada linha seja contada uma vez**, e isso a fila garante: cada mensagem vai
-para um único worker e só sai da fila depois do ack. A única exceção é rara: se um worker morrer
-**depois** de publicar a contagem e **antes** do ack, a linha volta para a fila e é contada duas
-vezes (veja *Limitações conhecidas*).
-
-### O que **não** é paralelo
-
-Vale saber para não ser pego de surpresa:
-
-- **Os dois leitores não dividem a leitura do disco.** Cada um lê o arquivo **inteiro** e descarta
-  as linhas da outra paridade. A divisão par/ímpar é exigência do enunciado. Ler é barato comparado
-  a contar, então isso pesa pouco.
-- **O dashboard é um só.** Ele recebe e soma todas as contagens sozinho, mas somar números é muito
-  mais leve que aplicar regex.
-- **O ganho não é proporcional.** 3 workers não deixam a execução exatamente 3× mais rápida: cada
-  linha também passa pela rede, é convertida para JSON e é confirmada no broker, e essa parte custa
-  o mesmo com 1 ou com 3 workers.
-
-### Como ver o paralelismo acontecendo
-
-| Onde | O que olhar |
-|---|---|
-| **Dashboard** | O quadro "Linhas processadas por worker" mostra cada worker com uma parte parecida do total |
-| **Dashboard** | O campo "linhas/s": rode o mesmo arquivo com 1 worker e depois com 3, e compare |
-| **RabbitMQ** (http://localhost:15672) | Aba **Queues**: `fila_linhas` com *Consumers = 3* |
-| **RabbitMQ** | Aba **Channels**: cada worker com *Prefetch 100* e linhas *Unacked* |
-| **Terminal** (`htop` ou `top`) | 3 processos `python worker.py` usando CPU ao mesmo tempo |
-
-O mesmo arquivo gerado por [gerar_arquivo.py](scripts/gerar_arquivo.py) dá sempre o mesmo
-gabarito, então os totais têm que bater com 1, 3 ou 10 workers. Esse é o teste de que o paralelismo
-não perdeu nem duplicou linhas.
-
-## Round-robin: como o broker reparte as linhas
-
-**Resposta curta:** o RabbitMQ entrega as linhas da `fila_linhas` aos workers **em rodízio**
-(worker-1, worker-2, worker-3, worker-1…), mas **pula quem está cheio**. "Cheio" quer dizer ter 100
-linhas recebidas e ainda não confirmadas (o `prefetch`). Então, no começo, a divisão é um rodízio
-certinho. Depois, quem confirma (ack) primeiro recebe a próxima linha, e o worker mais rápido acaba
-fazendo mais.
-
-### As três linhas de código envolvidas
-
-Todas ficam no [worker.py](src/worker.py):
-
-```python
-canal.basic_qos(prefetch_count=100)                                     # L28: limite de linhas sem ack
-canal.basic_consume(queue=config.FILA_LINHAS, on_message_callback=...)  # L43: entra no rodízio
-ch.basic_ack(delivery_tag=metodo.delivery_tag)                          # L41: "terminei", libera uma vaga
-```
-
-- `basic_consume` registra o worker como **consumidor** da fila. O broker guarda a lista de
-  consumidores e faz o rodízio entre eles.
-- `basic_qos(prefetch_count=100)` dá a cada worker **100 vagas**: no máximo 100 linhas entregues e
-  ainda não confirmadas.
-- `basic_ack` confirma uma linha. Ela sai da fila de vez e **libera uma vaga** para o broker mandar
-  outra.
-
-### O que o broker faz quando chega uma linha
-
-```
- chegou uma linha na fila_linhas
-              │
-              ▼
- próximo worker do rodízio ──▶ tem vaga (menos de 100 sem ack)?
-              ▲                       │               │
-              │                      sim             não
-              │                       │               │
-              │                       ▼               ▼
-              │              entrega a linha    pula para o próximo
-              │              a esse worker             │
-              │                                        │
-              └────────────────────────────────────────┘
-       (se ninguém tem vaga, a linha espera na fila como "Ready")
-```
-
-### Um exemplo acompanhado passo a passo
-
-Para o exemplo caber aqui: **3 workers**, **prefetch = 2** (no projeto é 100) e **9 linhas**
-(L1 a L9).
-
-**Fase 1: rodízio certinho, até todos lotarem.** As linhas chegam e o broker as entrega em ordem
-de rodízio:
-
-| Linha | Vai para | Linhas sem ack (w1 / w2 / w3) |
-|---|---|---|
-| L1 | worker-1 | 1 / 0 / 0 |
-| L2 | worker-2 | 1 / 1 / 0 |
-| L3 | worker-3 | 1 / 1 / 1 |
-| L4 | worker-1 | 2 / 1 / 1 |
-| L5 | worker-2 | 2 / 2 / 1 |
-| L6 | worker-3 | 2 / 2 / 2 ← **todos cheios** |
-| L7, L8, L9 | **ficam na fila** (*Ready*) | ninguém tem vaga |
-
-**Fase 2: quem confirma primeiro recebe a próxima.** Agora a velocidade de cada worker é que
-decide. Suponha que o worker-2 seja o mais rápido e o worker-3 o mais lento:
-
-| Acontecimento | O broker faz | Linhas sem ack (w1 / w2 / w3) |
-|---|---|---|
-| worker-2 dá ack em L2 | manda **L7** para o worker-2 | 2 / 2 / 2 |
-| worker-1 dá ack em L1 | manda **L8** para o worker-1 | 2 / 2 / 2 |
-| worker-2 dá ack em L5 | manda **L9** para o worker-2 | 2 / 2 / 2 |
-| fila vazia, os workers confirmam o que restou | (nada a mandar) | 0 / 0 / 0 |
-
-**Resultado:**
-
-| Worker | Linhas | Total |
-|---|---|---|
-| worker-1 | L1, L4, L8 | 3 |
-| worker-2 (mais rápido) | L2, L5, L7, L9 | **4** |
-| worker-3 (mais lento) | L3, L6 | **2** |
-
-O rodízio começou igual para todos, mas **o trabalho se ajustou à velocidade** de cada worker. É por
-isso que, no dashboard, os números por worker ficam **parecidos, mas não idênticos**.
-
-### Com e sem prefetch
-
-| | Sem `basic_qos` (rodízio cego) | Com `prefetch_count=100` (o projeto) |
-|---|---|---|
-| Como reparte | rigorosamente 1, 2, 3, 1, 2, 3… | rodízio, pulando quem tem 100 linhas sem ack |
-| Worker lento | recebe a **mesma quantidade** e atrasa o fim de tudo | recebe **menos**, e os outros compensam |
-| Onde ficam as linhas esperando | na memória dos workers | **na fila do broker** |
-| Se um worker morrer | todas as linhas que ele tinha recebido voltam para a fila | no máximo 100 voltam |
-
-E por que **100**, e não 1?
-
-- **Prefetch 1** dá a divisão mais justa possível, mas o worker fica parado esperando a rede a cada
-  linha (confirma, espera chegar a próxima, conta, confirma…).
-- **Prefetch 100** mantém sempre linhas "na mão" do worker, que nunca fica ocioso, e ainda deixa o
-  broker equilibrar a carga.
-
-### Detalhes que fazem diferença
-
-- **O rodízio é por mensagem, não por paridade.** Não existe "worker das linhas pares". Os dois
-  leitores publicam na mesma fila, as linhas pares e ímpares se misturam ali, e o rodízio pega
-  qualquer uma.
-- **Só entra no rodízio quem já está conectado.** Na primeira execução, os workers e os leitores
-  são abertos quase juntos, e o worker que se conecta primeiro pode já levar 100 linhas antes de os
-  outros chegarem. Com arquivo grande isso não importa; com arquivo pequeno, a divisão fica
-  desigual.
-- **Ordem das linhas.** Cada worker processa as suas em ordem, mas, entre workers diferentes, as
-  contagens chegam ao dashboard fora de ordem. Como o dashboard só soma, o resultado não muda.
-
-### Onde ver no RabbitMQ (http://localhost:15672)
-
-Durante uma execução com arquivo grande e 3 workers:
-
-| Aba | O que olhar | O que significa |
-|---|---|---|
-| **Queues** → `fila_linhas` | *Consumers* = 3 | os 3 workers estão no rodízio |
-| **Queues** → `fila_linhas` | *Unacked* até 300 | 3 workers × 100 linhas de prefetch |
-| **Queues** → `fila_linhas` | *Ready* | linhas esperando porque todos os workers estão cheios |
-| **Channels** | *Prefetch* = 100 e *Unacked* em cada canal | quanto cada worker está segurando agora |
-
-Se *Ready* fica crescendo, os leitores estão publicando mais rápido do que os workers conseguem
-contar. É nesse caso que vale abrir mais workers.
+**Índice**
+
+- **Apresentação:** [Roteiro da demonstração ao vivo](#roteiro-da-demonstração-ao-vivo) ·
+  [Perguntas da apresentação](#perguntas-da-apresentação)
+- **Referência:** [Como rodar](#como-rodar) ·
+  [Arquivo de entrada](#o-arquivo-de-entrada-scriptsgerar_arquivopy) ·
+  [Docker e pika](#docker-e-pika-como-os-programas-falam-com-o-rabbitmq) ·
+  [Arquitetura](#arquitetura-numeração-do-diagrama-do-enunciado) ·
+  [MOM e GIL](#conceitos-mom-e-gil) ·
+  [Paralelismo](#como-funciona-o-paralelismo) ·
+  [Round-robin](#round-robin-como-o-broker-reparte-as-linhas)
 
 ---
 
@@ -731,8 +188,9 @@ Daí em diante, siga as perguntas abaixo.
 
 ## Perguntas da apresentação
 
-Respostas às quatro perguntas, com link para a linha exata do código. Antes delas, dois conceitos
-que aparecem em todas as respostas: MOM e GIL.
+Respostas às quatro perguntas, mais duas de apoio (paralelismo e instanciação), com link para a
+linha exata do código. Os conceitos de MOM e GIL, que aparecem em várias respostas, estão em
+[Conceitos: MOM e GIL](#conceitos-mom-e-gil), mais abaixo.
 
 **Como usar na apresentação:** um monitor com o VS Code e o outro com este README. Cada pergunta
 tem uma **resposta curta**, uma **abertura** (falar antes da tabela), uma **tabela** para seguir
@@ -743,74 +201,6 @@ cada linha da tabela:
    O arquivo abre direto na linha.
 2. Mostre o trecho da coluna **Mostrar**.
 3. Fale o texto da coluna **Fala**.
-
-### Contexto: o que é MOM
-
-**MOM (Message-Oriented Middleware)** é um software intermediário que permite a programas trocarem
-**mensagens** sem falar diretamente uns com os outros. Em vez de o programa A chamar o programa B, A
-entrega a mensagem a um **broker** (o "carteiro"), e o broker a entrega a quem tiver interesse.
-
-Isso traz três tipos de **desacoplamento**:
-
-| Desacoplamento | O que significa | No projeto |
-|---|---|---|
-| **Espaço** | quem envia não sabe quem recebe, nem onde ele está | o leitor não sabe quantos workers existem nem quais são |
-| **Tempo** | quem envia e quem recebe não precisam estar ativos ao mesmo tempo, porque a fila guarda a mensagem | as linhas ficam na `fila_linhas` até algum worker pegar |
-| **Sincronização** | quem envia não fica esperando a resposta | o leitor publica e já segue para a próxima linha |
-
-O MOM tem **dois modelos** de comunicação, e o projeto usa os dois:
-
-| Modelo | Como funciona | No projeto |
-|---|---|---|
-| **Ponto a ponto (fila)** | cada mensagem é entregue a **um único** consumidor. Com vários consumidores na mesma fila, o broker reparte as mensagens entre eles | `fila_linhas`: cada linha vai para **um** worker. É assim que o trabalho é dividido |
-| **Publish/subscribe (tópico)** | a mensagem é entregue a **todos** os assinantes interessados | `topico_palavras`: os resultados vão para quem assinou, no caso o dashboard |
-
-**Peças usadas neste projeto:**
-
-- **RabbitMQ** é o broker, ou seja, o MOM de fato. Ele roda no Docker
-  ([docker-compose.yml](docker-compose.yml)).
-- **AMQP** é o protocolo de rede que o RabbitMQ fala.
-- **pika** é a biblioteca Python que fala AMQP. Ela é só o *cliente* do broker.
-- **Exchange** é o lugar onde se publica no RabbitMQ. Ninguém publica direto numa fila: a exchange
-  recebe a mensagem e a encaminha para as filas segundo a *routing key*.
-  - **Exchange padrão (`""`)** entrega direto na fila cujo nome é igual à routing key. É o que o
-    leitor usa para mandar linhas para a `fila_linhas`.
-  - **Exchange do tipo topic** entrega para as filas cujo padrão casa com a routing key (`*` casa
-    exatamente uma palavra). A fila `dashboard.ab12` está ligada a `*.ab12`, então recebe
-    `contagem.ab12`, `inicio.ab12` e `leitor_fim.ab12`.
-- **Ack** é a confirmação de que o consumidor terminou de processar. Enquanto não chega o ack, o
-  broker guarda a mensagem. Se o consumidor morrer antes de confirmar, o broker a entrega a outro.
-
-### Contexto: o que é GIL
-
-O **GIL (Global Interpreter Lock)** é uma trava do CPython (o Python "normal") que permite que
-**apenas uma thread por processo execute código Python de cada vez**. Mesmo numa máquina com 8
-núcleos, 8 threads Python que fazem cálculo se revezam num núcleo só. A troca entre elas é tão
-rápida que parece paralelo, mas não é.
-
-O GIL **é liberado** quando a thread fica esperando I/O (rede, disco, `time.sleep`). Por isso:
-
-| Tipo de tarefa | Threads ajudam? | Por quê |
-|---|---|---|
-| **I/O-bound** (esperar rede ou disco) | **Sim** | enquanto uma thread espera, ela solta o GIL e outra roda |
-| **CPU-bound** (calcular, aplicar regex) | **Não** | só uma thread por vez segura o GIL |
-
-**Como isso decide a arquitetura do projeto:**
-
-- **Contar palavras** (aplicar regex em cada linha) é trabalho de **CPU**. Com threads, os workers se
-  revezariam no GIL e não haveria ganho. Por isso cada worker é um **processo** separado
-  (`subprocess.Popen`). Cada processo tem o próprio interpretador e o próprio GIL, e o sistema
-  operacional os roda em núcleos diferentes ao mesmo tempo.
-- Isso combina com o MOM. Como os workers só se comunicam pelo broker, poderiam até rodar em
-  **máquinas diferentes**, bastando apontar `RABBITMQ_HOST` para o broker.
-- **No dashboard as threads não servem para ganhar velocidade.** Elas existem porque há **dois laços
-  que bloqueiam para sempre**: o `start_consuming()` do pika (espera mensagens da rede) e o
-  `mainloop()` do tkinter (espera eventos da janela). Cada laço precisa da sua própria thread. Como
-  a thread do pika passa quase todo o tempo esperando a rede, ela solta o GIL e não atrapalha a
-  interface.
-
-> Observação: o Python 3.13 trouxe uma versão experimental *free-threaded*, sem GIL (PEP 703), que
-> precisa ser instalada à parte. O Python padrão, usado aqui, continua com GIL.
 
 ### 1. Mostre a sequência de execução
 
@@ -1212,3 +602,640 @@ self.canal.start_consuming()                              # fica esperando mensa
 A cada mensagem, o pika chama `_ao_receber` ([dashboard.py#L110-L113](src/dashboard.py#L110-L113)).
 Ela pega o tipo pela routing key (`contagem`, `inicio` ou `leitor_fim`), entrega o conteúdo à
 interface por uma `queue.Queue` e confirma com ack.
+
+---
+
+## Como rodar
+
+```bash
+# 1) broker (precisa do Docker)
+docker compose up -d
+
+# 2) dependências (uma vez)
+python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt   # tkinter vem com o Python (Ubuntu: sudo apt install python3-tk)
+
+# 3) arquivo de teste (opcional) e aplicação
+./.venv/bin/python scripts/gerar_arquivo.py 200000 data/entrada.txt
+./.venv/bin/python src/cliente.py            # interface gráfica
+```
+
+### Ativando a venv (opcional)
+
+Os comandos acima chamam `./.venv/bin/python` direto e funcionam sem ativar nada. Se preferir
+digitar só `python`, ative a venv uma vez por terminal:
+
+```bash
+source .venv/bin/activate      # Linux/macOS (o prompt passa a mostrar "(.venv)")
+# .venv\Scripts\activate       # Windows
+
+python scripts/gerar_arquivo.py 200000 data/entrada.txt
+python src/cliente.py
+
+deactivate                     # para sair da venv
+```
+
+Sem interface (útil para testar): `python src/cliente.py --cli -a data/entrada.txt -p python,java,erro -w 3`.
+Painel do broker: http://localhost:15672 (guest/guest). Outro host: variável `RABBITMQ_HOST`.
+
+---
+
+## O arquivo de entrada: `scripts/gerar_arquivo.py`
+
+[gerar_arquivo.py](scripts/gerar_arquivo.py) é um **script auxiliar**, separado do sistema: **não
+usa o RabbitMQ**. Ele faz duas coisas:
+
+1. **Gera um arquivo de texto grande** para servir de entrada para a contagem.
+2. **Imprime um gabarito**, isto é, quantas vezes algumas palavras aparecem no arquivo, para conferir
+   se o dashboard acertou.
+
+```bash
+python scripts/gerar_arquivo.py 200000 data/entrada.txt
+#                               ^^^^^^ ^^^^^^^^^^^^^^^^
+#                               linhas  arquivo de saída (os dois são opcionais)
+```
+
+### Como ele funciona
+
+1. **Vocabulário fixo de 26 palavras**, todas do tema do trabalho
+   ([linhas 15-17](scripts/gerar_arquivo.py#L15-L17)): `python java erro sucesso fila topico broker
+   mensagem worker leitor dashboard paralelo processo thread rede servidor cliente dados arquivo
+   linha palavra contador sistema distribuido middleware evento`.
+2. **Sorteador com semente fixa** ([linha 23](scripts/gerar_arquivo.py#L23)):
+   `rnd = random.Random(42)`.
+3. **Cada linha tem de 5 a 20 palavras sorteadas** do vocabulário, com a primeira letra maiúscula e
+   um ponto no fim ([linhas 27-29](scripts/gerar_arquivo.py#L27-L29)).
+4. **Ao mesmo tempo que escreve, ele conta as palavras** com um `Counter`, sem broker e sem
+   paralelismo ([linha 30](scripts/gerar_arquivo.py#L30)).
+5. **No fim, imprime o gabarito** ([linhas 31-32](scripts/gerar_arquivo.py#L31-L32)).
+
+Exemplo com 3 linhas:
+
+```
+$ python scripts/gerar_arquivo.py 3 data/exemplo.txt
+3 linhas gravadas em data/exemplo.txt
+Contagem de referência: {'python': 2, 'java': 1, 'erro': 1, 'middleware': 0}
+
+$ cat data/exemplo.txt
+Python distribuido worker mensagem mensagem fila distribuido sucesso.
+Arquivo thread java python erro broker mensagem.
+Dados broker sistema palavra sistema.
+```
+
+### Por que ele gera sempre o mesmo arquivo
+
+O computador não sorteia de verdade. Ele usa uma fórmula que, a partir de um número inicial (a
+**semente**, aqui `42`), produz uma sequência que *parece* aleatória. Com a mesma semente, a
+sequência é sempre a mesma.
+
+Na prática:
+
+- **Mesmo número de linhas** → **exatamente o mesmo arquivo**, byte a byte.
+- **Mais linhas** → as primeiras continuam iguais, e o arquivo só fica mais comprido.
+
+Isso torna os testes **repetíveis**. Você pode rodar com 1 worker e depois com 3 sobre o mesmo
+arquivo para comparar o tempo, e sabe de antemão quais números o dashboard deve mostrar. Para gerar
+um arquivo diferente, troque o `42` por outro número, ou use `random.Random()` sem número.
+
+### Como usar o gabarito
+
+Conte `python, java, erro, middleware` no arquivo gerado. Os totais do dashboard têm que ser
+**iguais** à contagem de referência. Se forem, fica provado que, ao passar por leitores → fila →
+workers → tópico → dashboard:
+
+- **nenhuma linha se perdeu**;
+- **nenhuma linha foi contada duas vezes**, mesmo com o trabalho dividido entre vários workers.
+
+A maiúscula do início da linha ("Python") e o ponto no fim ("sucesso.") não atrapalham: o worker
+conta sem diferenciar maiúsculas e minúsculas e só considera palavras inteiras
+([config.py#L82-L87](src/config.py#L82-L87)).
+
+---
+
+## Docker e pika: como os programas falam com o RabbitMQ
+
+**Resumo:** o **Docker** roda o RabbitMQ, que é o broker. O **pika** é a biblioteca Python que os
+programas usam para falar com ele. **Só o RabbitMQ roda no Docker**: cliente, leitores, workers e
+dashboard rodam direto no computador, pela venv, e se conectam ao broker pela porta 5672.
+
+```
+ Seu computador                                         Container Docker "mom_rabbitmq"
+ ┌──────────────────────────────────┐                  ┌───────────────────────────────┐
+ │ cliente.py   ─┐                  │                  │                               │
+ │ leitor.py ×2 ─┤ pika             │   localhost:5672 │   RabbitMQ (broker)           │
+ │ worker.py ×3 ─┼─────────────────────────────────────▶   fila_linhas                 │
+ │ dashboard.py ─┘     (AMQP)       │                  │   topico_palavras             │
+ │                                  │                  │   dashboard.<run>             │
+ │ navegador ──────────────────────────────────────────▶   painel web                  │
+ │                                  │  localhost:15672 │                               │
+ └──────────────────────────────────┘                  └───────────────────────────────┘
+```
+
+### Docker: o broker num container
+
+Todo o Docker do projeto está no [docker-compose.yml](docker-compose.yml):
+
+```yaml
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: mom_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+```
+
+| Linha | O que faz |
+|---|---|
+| `image: rabbitmq:3-management` | Usa a imagem oficial do RabbitMQ versão 3. O sufixo `-management` traz o **painel web**. |
+| `container_name: mom_rabbitmq` | Dá um nome fixo ao container, para usar em `docker ps` e `docker exec`. |
+| `ports: "5672:5672"` | Liga a porta 5672 **do computador** à porta 5672 **do container**. É a porta do protocolo **AMQP**, por onde o pika conversa com o broker. |
+| `ports: "15672:15672"` | O mesmo para o painel web (http://localhost:15672, usuário e senha `guest`). |
+| `healthcheck` | A cada 5 s, o Docker roda `rabbitmq-diagnostics ping` dentro do container para saber se o broker já responde. Depois disso, o container aparece como **healthy**. |
+
+**Por que usar Docker:**
+
+- **Nada a instalar:** o RabbitMQ é escrito em Erlang. Sem Docker, seria preciso instalar e
+  configurar o Erlang e o RabbitMQ. Com Docker, basta um comando.
+- **Mesma versão para todos:** você, os colegas e o professor rodam o mesmo broker.
+- **Fácil de limpar:** `docker compose down` remove tudo, sem deixar resto no sistema.
+
+**Comandos do dia a dia:**
+
+```bash
+docker compose up -d        # sobe o broker em segundo plano (-d = detached)
+docker compose ps           # mostra o status; espere aparecer "healthy"
+docker compose logs -f      # acompanha os logs do RabbitMQ (Ctrl+C para sair)
+docker compose stop         # para o container, mas mantém filas e mensagens
+docker compose down         # para E APAGA o container (perde filas e mensagens)
+
+# olhar dentro do broker pelo terminal, sem o painel:
+docker exec mom_rabbitmq rabbitmqctl list_queues name messages consumers
+```
+
+**Dois cuidados:**
+
+1. **Espere o broker ficar pronto.** O RabbitMQ leva alguns segundos para subir. Se o cliente for
+   aberto cedo demais, aparece "Não foi possível conectar ao RabbitMQ…"
+   ([cliente.py#L54-L59](src/cliente.py#L54-L59)). Rode `docker compose ps` e espere o **healthy**.
+2. **A persistência tem limite.** A `fila_linhas` é durável e as mensagens são persistentes, então
+   elas sobrevivem a um **reinício** do broker (`docker compose stop` e depois `up`). Mas o
+   `docker-compose.yml` não tem **volume**: os dados ficam dentro do container, e um
+   `docker compose down` apaga tudo. Para sobreviver à remoção do container, seria preciso montar um
+   volume em `/var/lib/rabbitmq`.
+
+### pika: a biblioteca que fala com o broker
+
+O **pika** (única dependência do [requirements.txt](requirements.txt)) é um **cliente** do
+protocolo AMQP, o protocolo que o RabbitMQ fala. Não confunda: o MOM é o RabbitMQ, e o pika só
+envia e recebe mensagens dele.
+
+**Conexão e canal.** Tudo começa em [config.py#L32-L41](src/config.py#L32-L41):
+
+```python
+def conectar():
+    params = pika.ConnectionParameters(
+        host=BROKER_HOST,                 # "localhost", a porta que o Docker expõe
+        port=BROKER_PORT,                 # 5672
+        credentials=pika.PlainCredentials(BROKER_USER, BROKER_PASS),   # guest/guest
+        heartbeat=60,                     # sinal periódico para detectar conexão morta
+        blocked_connection_timeout=300,
+    )
+    return pika.BlockingConnection(params)
+```
+
+E cada programa faz:
+
+```python
+conn = config.conectar()     # 1 conexão TCP com o broker
+canal = conn.channel()       # 1 canal dentro dela; todas as operações passam pelo canal
+```
+
+- **`BlockingConnection`** é a conexão **bloqueante** (síncrona): cada chamada espera a resposta do
+  broker antes de seguir. É a forma mais simples de usar o pika.
+- **Canal** é uma "conversa" dentro da conexão TCP. O projeto usa 1 canal por conexão. É isso que
+  aparece nas abas *Connections* e *Channels* do painel.
+- O endereço vem de variáveis de ambiente ([config.py#L23-L26](src/config.py#L23-L26)), com
+  `localhost` como padrão. Com `RABBITMQ_HOST=<ip>`, os programas usam o broker de outra máquina,
+  sem mudar o código.
+
+**As chamadas do pika usadas no projeto:**
+
+| Chamada | Para que serve | Onde |
+|---|---|---|
+| `queue_declare` | cria a fila, se ainda não existir (é **idempotente**) | [config.py#L46](src/config.py#L46), [config.py#L64](src/config.py#L64) |
+| `exchange_declare` | cria o tópico (exchange do tipo `topic`) | [config.py#L47](src/config.py#L47) |
+| `queue_bind` | liga a fila do dashboard ao tópico com o padrão `*.<run>` | [config.py#L65](src/config.py#L65) |
+| `BasicProperties(delivery_mode=2)` | marca a mensagem como persistente (gravada em disco) | [leitor.py#L35](src/leitor.py#L35) |
+| `basic_publish` | **publica** uma mensagem numa exchange | [leitor.py#L48](src/leitor.py#L48), [config.py#L70](src/config.py#L70) |
+| `basic_qos` | define o **prefetch**: quantas mensagens sem ack o consumidor aceita | [worker.py#L28](src/worker.py#L28), [dashboard.py#L97](src/dashboard.py#L97) |
+| `basic_consume` | registra o **callback** que recebe as mensagens de uma fila | [worker.py#L43](src/worker.py#L43), [dashboard.py#L98](src/dashboard.py#L98) |
+| `start_consuming` | entra no laço que espera mensagens e chama o callback | [worker.py#L46](src/worker.py#L46), [dashboard.py#L99](src/dashboard.py#L99) |
+| `basic_ack` | **confirma** que a mensagem foi processada; só então o broker a apaga | [worker.py#L41](src/worker.py#L41), [dashboard.py#L113](src/dashboard.py#L113) |
+| `stop_consuming` / `queue_delete` | encerra o consumo e apaga a fila do dashboard | [dashboard.py#L119-L122](src/dashboard.py#L119-L122) |
+| `add_callback_threadsafe` | pede, de outra thread, que a thread do pika execute uma função | [dashboard.py#L124](src/dashboard.py#L124) |
+
+**O callback.** O pika chama a função registrada em `basic_consume` a cada mensagem, sempre com
+quatro argumentos ([worker.py#L32](src/worker.py#L32)):
+
+```python
+def ao_receber(ch, metodo, props, corpo):
+    msg = json.loads(corpo)                          # corpo chega em BYTES → JSON → dict
+    ...
+    ch.basic_ack(delivery_tag=metodo.delivery_tag)   # metodo traz o delivery_tag e a routing_key
+```
+
+| Argumento | O que é |
+|---|---|
+| `ch` | o canal, usado para publicar e dar ack de dentro do callback |
+| `metodo` | dados da entrega: `delivery_tag` (o "número" da entrega, usado no ack) e `routing_key` (o dashboard usa para saber o tipo da mensagem) |
+| `props` | propriedades da mensagem, como `delivery_mode` (o projeto não usa) |
+| `corpo` | o conteúdo, em **bytes**. Por isso se publica com `json.dumps(...).encode("utf-8")` e se lê com `json.loads(corpo)` |
+
+**O pika não é thread-safe.** Uma `BlockingConnection` só pode ser usada pela thread que a criou. Por
+isso, no dashboard, **só a thread `Assinante` fala com o broker**. A interface recebe os dados por
+uma `queue.Queue`, e para encerrar usa `add_callback_threadsafe`, que pede à própria thread do pika
+para parar ([dashboard.py#L115-L126](src/dashboard.py#L115-L126)).
+
+---
+
+## Arquitetura (numeração do diagrama do enunciado)
+
+| # | Componente | Arquivo | Papel no MOM |
+|---|---|---|---|
+| 1 | Cliente | `src/cliente.py` | pede arquivo/palavras, sobe workers, dashboard e os 2 leitores |
+| 2 | Leitor de linhas (par e ímpar) | `src/leitor.py` | **Produtor** da fila |
+| 3 | Fila de linhas | `fila_linhas` (RabbitMQ) | fila durável, entrega round-robin |
+| 4 | Contador de palavras (workers) | `src/worker.py` | **Consumidor** da fila + **Publisher** do tópico |
+| 5 | Tópico de palavras | exchange `topico_palavras` (tipo *topic*) | publish/subscribe |
+| 6 | Dashboard | `src/dashboard.py` | **Subscriber** do tópico |
+
+`src/config.py` concentra a conexão e a topologia; `scripts/gerar_arquivo.py` cria o arquivo de teste.
+
+### Fluxo de mensagens
+
+1. Cliente cria a fila `dashboard.<run>` já ligada ao tópico (`*.<run>`) e publica `inicio.<run>`
+   (arquivo + palavras). Isso vem *antes* dos leitores porque o tópico não guarda mensagens:
+   sem a fila pré-criada, o dashboard poderia perder as primeiras contagens.
+2. Cada leitor lê o arquivo em streaming, e para cada linha da sua paridade publica
+   `{run_id, linha, texto, palavras}` em `fila_linhas`. Linhas numeradas a partir de 1
+   (ímpar = 1, 3, 5…; par = 2, 4, 6…).
+3. Os workers (competing consumers) pegam linhas da fila, contam cada palavra-chave
+   (palavra inteira, sem diferenciar maiúsculas/minúsculas), publicam `contagem.<run>` com
+   `{linha, contagem, worker}` e só então dão **ack**. Se um worker morrer antes do ack, a
+   linha volta para a fila e outro a processa (entrega *at-least-once*).
+4. Ao terminar, cada leitor publica `leitor_fim.<run>` com quantas linhas enviou. O dashboard soma
+   os dois totais e sabe que acabou quando `linhas processadas == linhas enviadas`.
+5. O dashboard soma as contagens, mostra barras por palavra, progresso, linhas/s e quantas linhas
+   cada worker processou (evidência do paralelismo).
+
+### Decisões de projeto (para a explicação do código)
+
+- **Por que fila e tópico?** A fila distribui *trabalho* (cada linha vai para **um** worker); o
+  tópico distribui *informação* (todo assinante interessado recebe). É a diferença entre os dois
+  modelos de MOM pedidos no enunciado.
+- **Mensagens persistentes + fila durável** e **ack manual** garantem que nenhuma linha se perde.
+- **`prefetch`=100** nos workers: cada um recebe um lote de linhas por vez, em vez de uma ida ao
+  broker por linha.
+- **Threads no dashboard:** o pika `BlockingConnection` não é thread-safe; só a thread assinante
+  fala com o broker e entrega os dados à interface (tkinter) por uma `queue.Queue`.
+- **Isolamento por `run_id`:** resultados de execuções antigas não se misturam com a atual.
+
+### Limitações conhecidas
+
+- Com entrega *at-least-once*, uma falha de worker entre publicar e dar ack pode contar uma linha
+  duas vezes (raro; dedupe por número de linha exigiria guardar todos os números no dashboard).
+- Palavras são comparadas literalmente: "ação" ≠ "acao".
+
+---
+
+## Conceitos: MOM e GIL
+
+### Contexto: o que é MOM
+
+**MOM (Message-Oriented Middleware)** é um software intermediário que permite a programas trocarem
+**mensagens** sem falar diretamente uns com os outros. Em vez de o programa A chamar o programa B, A
+entrega a mensagem a um **broker** (o "carteiro"), e o broker a entrega a quem tiver interesse.
+
+Isso traz três tipos de **desacoplamento**:
+
+| Desacoplamento | O que significa | No projeto |
+|---|---|---|
+| **Espaço** | quem envia não sabe quem recebe, nem onde ele está | o leitor não sabe quantos workers existem nem quais são |
+| **Tempo** | quem envia e quem recebe não precisam estar ativos ao mesmo tempo, porque a fila guarda a mensagem | as linhas ficam na `fila_linhas` até algum worker pegar |
+| **Sincronização** | quem envia não fica esperando a resposta | o leitor publica e já segue para a próxima linha |
+
+O MOM tem **dois modelos** de comunicação, e o projeto usa os dois:
+
+| Modelo | Como funciona | No projeto |
+|---|---|---|
+| **Ponto a ponto (fila)** | cada mensagem é entregue a **um único** consumidor. Com vários consumidores na mesma fila, o broker reparte as mensagens entre eles | `fila_linhas`: cada linha vai para **um** worker. É assim que o trabalho é dividido |
+| **Publish/subscribe (tópico)** | a mensagem é entregue a **todos** os assinantes interessados | `topico_palavras`: os resultados vão para quem assinou, no caso o dashboard |
+
+**Peças usadas neste projeto:**
+
+- **RabbitMQ** é o broker, ou seja, o MOM de fato. Ele roda no Docker
+  ([docker-compose.yml](docker-compose.yml)).
+- **AMQP** é o protocolo de rede que o RabbitMQ fala.
+- **pika** é a biblioteca Python que fala AMQP. Ela é só o *cliente* do broker.
+- **Exchange** é o lugar onde se publica no RabbitMQ. Ninguém publica direto numa fila: a exchange
+  recebe a mensagem e a encaminha para as filas segundo a *routing key*.
+  - **Exchange padrão (`""`)** entrega direto na fila cujo nome é igual à routing key. É o que o
+    leitor usa para mandar linhas para a `fila_linhas`.
+  - **Exchange do tipo topic** entrega para as filas cujo padrão casa com a routing key (`*` casa
+    exatamente uma palavra). A fila `dashboard.ab12` está ligada a `*.ab12`, então recebe
+    `contagem.ab12`, `inicio.ab12` e `leitor_fim.ab12`.
+- **Ack** é a confirmação de que o consumidor terminou de processar. Enquanto não chega o ack, o
+  broker guarda a mensagem. Se o consumidor morrer antes de confirmar, o broker a entrega a outro.
+
+### Contexto: o que é GIL
+
+O **GIL (Global Interpreter Lock)** é uma trava do CPython (o Python "normal") que permite que
+**apenas uma thread por processo execute código Python de cada vez**. Mesmo numa máquina com 8
+núcleos, 8 threads Python que fazem cálculo se revezam num núcleo só. A troca entre elas é tão
+rápida que parece paralelo, mas não é.
+
+O GIL **é liberado** quando a thread fica esperando I/O (rede, disco, `time.sleep`). Por isso:
+
+| Tipo de tarefa | Threads ajudam? | Por quê |
+|---|---|---|
+| **I/O-bound** (esperar rede ou disco) | **Sim** | enquanto uma thread espera, ela solta o GIL e outra roda |
+| **CPU-bound** (calcular, aplicar regex) | **Não** | só uma thread por vez segura o GIL |
+
+**Como isso decide a arquitetura do projeto:**
+
+- **Contar palavras** (aplicar regex em cada linha) é trabalho de **CPU**. Com threads, os workers se
+  revezariam no GIL e não haveria ganho. Por isso cada worker é um **processo** separado
+  (`subprocess.Popen`). Cada processo tem o próprio interpretador e o próprio GIL, e o sistema
+  operacional os roda em núcleos diferentes ao mesmo tempo.
+- Isso combina com o MOM. Como os workers só se comunicam pelo broker, poderiam até rodar em
+  **máquinas diferentes**, bastando apontar `RABBITMQ_HOST` para o broker.
+- **No dashboard as threads não servem para ganhar velocidade.** Elas existem porque há **dois laços
+  que bloqueiam para sempre**: o `start_consuming()` do pika (espera mensagens da rede) e o
+  `mainloop()` do tkinter (espera eventos da janela). Cada laço precisa da sua própria thread. Como
+  a thread do pika passa quase todo o tempo esperando a rede, ela solta o GIL e não atrapalha a
+  interface.
+
+> Observação: o Python 3.13 trouxe uma versão experimental *free-threaded*, sem GIL (PEP 703), que
+> precisa ser instalada à parte. O Python padrão, usado aqui, continua com GIL.
+
+---
+
+## Como funciona o paralelismo
+
+**Resposta curta:** cada worker é um **processo** separado, e todos consomem a **mesma fila**. O
+broker entrega cada linha a um único worker, então N workers contam N lotes de linhas **ao mesmo
+tempo**, em núcleos diferentes da CPU. Nenhum código do projeto divide o trabalho: quem divide é o
+RabbitMQ.
+
+O paralelismo vem de três mecanismos que trabalham juntos.
+
+### 1. Processos, não threads
+
+O cliente abre cada worker como um **processo** do sistema operacional
+([cliente.py#L37-L41](src/cliente.py#L37-L41)):
+
+```python
+for i in range(len(self.workers), n):
+    self.workers.append(_py("worker.py", "--id", str(i + 1), ...))   # _py = subprocess.Popen
+```
+
+**Por que processos?** Por causa do **GIL** do Python (veja [o que é GIL](#contexto-o-que-é-gil)).
+Dentro de um processo, só uma thread executa código Python por vez. Contar palavras com regex é
+trabalho de CPU, então 3 threads se revezariam num núcleo só. Já 3 processos têm 3 interpretadores
+e 3 GILs, e o sistema operacional os coloca em 3 núcleos ao mesmo tempo.
+
+```
+ Threads (não usado)                 Processos (usado)
+ ┌──────── 1 processo ────────┐      ┌─ processo ─┐ ┌─ processo ─┐ ┌─ processo ─┐
+ │  GIL: uma thread por vez   │      │  worker-1  │ │  worker-2  │ │  worker-3  │
+ │  T1 ▓▓░░░░▓▓░░░░           │      │  ▓▓▓▓▓▓▓▓  │ │  ▓▓▓▓▓▓▓▓  │ │  ▓▓▓▓▓▓▓▓  │
+ │  T2 ░░▓▓░░░░▓▓░░           │      │  núcleo 1  │ │  núcleo 2  │ │  núcleo 3  │
+ │  T3 ░░░░▓▓░░░░▓▓           │      └────────────┘ └────────────┘ └────────────┘
+ └────────────────────────────┘
+```
+
+### 2. Competing consumers: o broker divide o trabalho
+
+Todos os workers fazem `basic_consume` na **mesma fila** ([worker.py#L43](src/worker.py#L43)):
+
+```python
+canal.basic_consume(queue=config.FILA_LINHAS, on_message_callback=ao_receber)
+```
+
+Quando vários consumidores leem a mesma fila, o RabbitMQ entrega **cada mensagem a um só deles**,
+revezando (*round-robin*). Esse padrão se chama **competing consumers** (consumidores concorrentes):
+os workers "competem" pelas linhas. Por isso:
+
+- **nenhum worker sabe dos outros**, e não há código de divisão, índice ou coordenação;
+- para ter mais paralelismo, **basta abrir mais workers**, sem mudar nada no código;
+- se um worker morrer, os outros continuam, e as linhas que ele não confirmou (ack) voltam para a
+  fila.
+
+### 3. Prefetch: lotes em vez de uma linha por vez
+
+```python
+canal.basic_qos(prefetch_count=100)     # worker.py#L28
+```
+
+O prefetch diz ao broker: "mande até **100 linhas sem ack** para este worker". Isso tem dois
+efeitos:
+
+- **Menos idas e vindas:** o worker já tem as próximas linhas na mão, em vez de pedir uma por uma
+  pela rede.
+- **Divisão justa:** o broker só manda mais linhas quando o worker confirma as anteriores. Um worker
+  mais lento recebe menos, e os mais rápidos pegam o resto. A carga se ajusta sozinha.
+
+Sem `basic_qos`, o broker repartiria as linhas num rodízio cego: cada worker receberia a mesma
+quantidade, fosse rápido ou lento, e todas as linhas se acumulariam na memória dos workers. Os
+detalhes estão em [Round-robin](#round-robin-como-o-broker-reparte-as-linhas).
+
+A demo deve usar um **arquivo grande**. Na primeira execução, os workers são abertos junto com os
+leitores, e o primeiro worker a se conectar já pode levar 100 linhas de uma vez. Com um arquivo
+pequeno, ele pode fazer quase tudo sozinho, e a demo parece não ter paralelismo.
+
+### Além dos workers: as etapas também rodam ao mesmo tempo
+
+Os leitores, os workers e o dashboard são processos separados, e as linhas passam pela fila como
+numa **linha de montagem**. Ninguém espera a etapa anterior terminar:
+
+```
+tempo ─────────────────────────────────────────────────────────▶
+leitor ímpar  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+leitor par    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+worker-1        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+worker-2        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+worker-3        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+dashboard         ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+```
+
+Enquanto os leitores ainda leem o fim do arquivo, os workers já contam as primeiras linhas e o
+dashboard já está somando.
+
+### Por que o resultado sai certo, mesmo fora de ordem
+
+Os workers terminam as linhas em **qualquer ordem**: a linha 7 pode chegar ao dashboard antes da
+linha 2. Isso não importa, porque o dashboard só **soma**, e a ordem das parcelas não muda a soma.
+O número da linha vai na mensagem só para rastreio.
+
+O que importa é que **cada linha seja contada uma vez**, e isso a fila garante: cada mensagem vai
+para um único worker e só sai da fila depois do ack. A única exceção é rara: se um worker morrer
+**depois** de publicar a contagem e **antes** do ack, a linha volta para a fila e é contada duas
+vezes (veja *Limitações conhecidas*).
+
+### O que **não** é paralelo
+
+Vale saber para não ser pego de surpresa:
+
+- **Os dois leitores não dividem a leitura do disco.** Cada um lê o arquivo **inteiro** e descarta
+  as linhas da outra paridade. A divisão par/ímpar é exigência do enunciado. Ler é barato comparado
+  a contar, então isso pesa pouco.
+- **O dashboard é um só.** Ele recebe e soma todas as contagens sozinho, mas somar números é muito
+  mais leve que aplicar regex.
+- **O ganho não é proporcional.** 3 workers não deixam a execução exatamente 3× mais rápida: cada
+  linha também passa pela rede, é convertida para JSON e é confirmada no broker, e essa parte custa
+  o mesmo com 1 ou com 3 workers.
+
+### Como ver o paralelismo acontecendo
+
+| Onde | O que olhar |
+|---|---|
+| **Dashboard** | O quadro "Linhas processadas por worker" mostra cada worker com uma parte parecida do total |
+| **Dashboard** | O campo "linhas/s": rode o mesmo arquivo com 1 worker e depois com 3, e compare |
+| **RabbitMQ** (http://localhost:15672) | Aba **Queues**: `fila_linhas` com *Consumers = 3* |
+| **RabbitMQ** | Aba **Channels**: cada worker com *Prefetch 100* e linhas *Unacked* |
+| **Terminal** (`htop` ou `top`) | 3 processos `python worker.py` usando CPU ao mesmo tempo |
+
+O mesmo arquivo gerado por [gerar_arquivo.py](scripts/gerar_arquivo.py) dá sempre o mesmo
+gabarito, então os totais têm que bater com 1, 3 ou 10 workers. Esse é o teste de que o paralelismo
+não perdeu nem duplicou linhas.
+
+---
+
+## Round-robin: como o broker reparte as linhas
+
+**Resposta curta:** o RabbitMQ entrega as linhas da `fila_linhas` aos workers **em rodízio**
+(worker-1, worker-2, worker-3, worker-1…), mas **pula quem está cheio**. "Cheio" quer dizer ter 100
+linhas recebidas e ainda não confirmadas (o `prefetch`). Então, no começo, a divisão é um rodízio
+certinho. Depois, quem confirma (ack) primeiro recebe a próxima linha, e o worker mais rápido acaba
+fazendo mais.
+
+### As três linhas de código envolvidas
+
+Todas ficam no [worker.py](src/worker.py):
+
+```python
+canal.basic_qos(prefetch_count=100)                                     # L28: limite de linhas sem ack
+canal.basic_consume(queue=config.FILA_LINHAS, on_message_callback=...)  # L43: entra no rodízio
+ch.basic_ack(delivery_tag=metodo.delivery_tag)                          # L41: "terminei", libera uma vaga
+```
+
+- `basic_consume` registra o worker como **consumidor** da fila. O broker guarda a lista de
+  consumidores e faz o rodízio entre eles.
+- `basic_qos(prefetch_count=100)` dá a cada worker **100 vagas**: no máximo 100 linhas entregues e
+  ainda não confirmadas.
+- `basic_ack` confirma uma linha. Ela sai da fila de vez e **libera uma vaga** para o broker mandar
+  outra.
+
+### O que o broker faz quando chega uma linha
+
+```
+ chegou uma linha na fila_linhas
+              │
+              ▼
+ próximo worker do rodízio ──▶ tem vaga (menos de 100 sem ack)?
+              ▲                       │               │
+              │                      sim             não
+              │                       │               │
+              │                       ▼               ▼
+              │              entrega a linha    pula para o próximo
+              │              a esse worker             │
+              │                                        │
+              └────────────────────────────────────────┘
+       (se ninguém tem vaga, a linha espera na fila como "Ready")
+```
+
+### Um exemplo acompanhado passo a passo
+
+Para o exemplo caber aqui: **3 workers**, **prefetch = 2** (no projeto é 100) e **9 linhas**
+(L1 a L9).
+
+**Fase 1: rodízio certinho, até todos lotarem.** As linhas chegam e o broker as entrega em ordem
+de rodízio:
+
+| Linha | Vai para | Linhas sem ack (w1 / w2 / w3) |
+|---|---|---|
+| L1 | worker-1 | 1 / 0 / 0 |
+| L2 | worker-2 | 1 / 1 / 0 |
+| L3 | worker-3 | 1 / 1 / 1 |
+| L4 | worker-1 | 2 / 1 / 1 |
+| L5 | worker-2 | 2 / 2 / 1 |
+| L6 | worker-3 | 2 / 2 / 2 ← **todos cheios** |
+| L7, L8, L9 | **ficam na fila** (*Ready*) | ninguém tem vaga |
+
+**Fase 2: quem confirma primeiro recebe a próxima.** Agora a velocidade de cada worker é que
+decide. Suponha que o worker-2 seja o mais rápido e o worker-3 o mais lento:
+
+| Acontecimento | O broker faz | Linhas sem ack (w1 / w2 / w3) |
+|---|---|---|
+| worker-2 dá ack em L2 | manda **L7** para o worker-2 | 2 / 2 / 2 |
+| worker-1 dá ack em L1 | manda **L8** para o worker-1 | 2 / 2 / 2 |
+| worker-2 dá ack em L5 | manda **L9** para o worker-2 | 2 / 2 / 2 |
+| fila vazia, os workers confirmam o que restou | (nada a mandar) | 0 / 0 / 0 |
+
+**Resultado:**
+
+| Worker | Linhas | Total |
+|---|---|---|
+| worker-1 | L1, L4, L8 | 3 |
+| worker-2 (mais rápido) | L2, L5, L7, L9 | **4** |
+| worker-3 (mais lento) | L3, L6 | **2** |
+
+O rodízio começou igual para todos, mas **o trabalho se ajustou à velocidade** de cada worker. É por
+isso que, no dashboard, os números por worker ficam **parecidos, mas não idênticos**.
+
+### Com e sem prefetch
+
+| | Sem `basic_qos` (rodízio cego) | Com `prefetch_count=100` (o projeto) |
+|---|---|---|
+| Como reparte | rigorosamente 1, 2, 3, 1, 2, 3… | rodízio, pulando quem tem 100 linhas sem ack |
+| Worker lento | recebe a **mesma quantidade** e atrasa o fim de tudo | recebe **menos**, e os outros compensam |
+| Onde ficam as linhas esperando | na memória dos workers | **na fila do broker** |
+| Se um worker morrer | todas as linhas que ele tinha recebido voltam para a fila | no máximo 100 voltam |
+
+E por que **100**, e não 1?
+
+- **Prefetch 1** dá a divisão mais justa possível, mas o worker fica parado esperando a rede a cada
+  linha (confirma, espera chegar a próxima, conta, confirma…).
+- **Prefetch 100** mantém sempre linhas "na mão" do worker, que nunca fica ocioso, e ainda deixa o
+  broker equilibrar a carga.
+
+### Detalhes que fazem diferença
+
+- **O rodízio é por mensagem, não por paridade.** Não existe "worker das linhas pares". Os dois
+  leitores publicam na mesma fila, as linhas pares e ímpares se misturam ali, e o rodízio pega
+  qualquer uma.
+- **Só entra no rodízio quem já está conectado.** Na primeira execução, os workers e os leitores
+  são abertos quase juntos, e o worker que se conecta primeiro pode já levar 100 linhas antes de os
+  outros chegarem. Com arquivo grande isso não importa; com arquivo pequeno, a divisão fica
+  desigual.
+- **Ordem das linhas.** Cada worker processa as suas em ordem, mas, entre workers diferentes, as
+  contagens chegam ao dashboard fora de ordem. Como o dashboard só soma, o resultado não muda.
+
+### Onde ver no RabbitMQ (http://localhost:15672)
+
+Durante uma execução com arquivo grande e 3 workers:
+
+| Aba | O que olhar | O que significa |
+|---|---|---|
+| **Queues** → `fila_linhas` | *Consumers* = 3 | os 3 workers estão no rodízio |
+| **Queues** → `fila_linhas` | *Unacked* até 300 | 3 workers × 100 linhas de prefetch |
+| **Queues** → `fila_linhas` | *Ready* | linhas esperando porque todos os workers estão cheios |
+| **Channels** | *Prefetch* = 100 e *Unacked* em cada canal | quanto cada worker está segurando agora |
+
+Se *Ready* fica crescendo, os leitores estão publicando mais rápido do que os workers conseguem
+contar. É nesse caso que vale abrir mais workers.
