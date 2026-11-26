@@ -36,6 +36,76 @@ deactivate                     # para sair da venv
 Sem interface (útil para testar): `python src/cliente.py --cli -a data/entrada.txt -p python,java,erro -w 3`.
 Painel do broker: http://localhost:15672 (guest/guest). Outro host: variável `RABBITMQ_HOST`.
 
+## O arquivo de entrada: `scripts/gerar_arquivo.py`
+
+[gerar_arquivo.py](scripts/gerar_arquivo.py) é um **script auxiliar**, separado do sistema: **não
+usa o RabbitMQ**. Ele faz duas coisas:
+
+1. **Gera um arquivo de texto grande** para servir de entrada para a contagem.
+2. **Imprime um gabarito**, isto é, quantas vezes algumas palavras aparecem no arquivo, para conferir
+   se o dashboard acertou.
+
+```bash
+python scripts/gerar_arquivo.py 200000 data/entrada.txt
+#                               ^^^^^^ ^^^^^^^^^^^^^^^^
+#                               linhas  arquivo de saída (os dois são opcionais)
+```
+
+### Como ele funciona
+
+1. **Vocabulário fixo de 26 palavras**, todas do tema do trabalho
+   ([linhas 15-17](scripts/gerar_arquivo.py#L15-L17)): `python java erro sucesso fila topico broker
+   mensagem worker leitor dashboard paralelo processo thread rede servidor cliente dados arquivo
+   linha palavra contador sistema distribuido middleware evento`.
+2. **Sorteador com semente fixa** ([linha 23](scripts/gerar_arquivo.py#L23)):
+   `rnd = random.Random(42)`.
+3. **Cada linha tem de 5 a 20 palavras sorteadas** do vocabulário, com a primeira letra maiúscula e
+   um ponto no fim ([linhas 27-29](scripts/gerar_arquivo.py#L27-L29)).
+4. **Ao mesmo tempo que escreve, ele conta as palavras** com um `Counter`, sem broker e sem
+   paralelismo ([linha 30](scripts/gerar_arquivo.py#L30)).
+5. **No fim, imprime o gabarito** ([linhas 31-32](scripts/gerar_arquivo.py#L31-L32)).
+
+Exemplo com 3 linhas:
+
+```
+$ python scripts/gerar_arquivo.py 3 data/exemplo.txt
+3 linhas gravadas em data/exemplo.txt
+Contagem de referência: {'python': 2, 'java': 1, 'erro': 1, 'middleware': 0}
+
+$ cat data/exemplo.txt
+Python distribuido worker mensagem mensagem fila distribuido sucesso.
+Arquivo thread java python erro broker mensagem.
+Dados broker sistema palavra sistema.
+```
+
+### Por que ele gera sempre o mesmo arquivo
+
+O computador não sorteia de verdade. Ele usa uma fórmula que, a partir de um número inicial (a
+**semente**, aqui `42`), produz uma sequência que *parece* aleatória. Com a mesma semente, a
+sequência é sempre a mesma.
+
+Na prática:
+
+- **Mesmo número de linhas** → **exatamente o mesmo arquivo**, byte a byte.
+- **Mais linhas** → as primeiras continuam iguais, e o arquivo só fica mais comprido.
+
+Isso torna os testes **repetíveis**. Você pode rodar com 1 worker e depois com 3 sobre o mesmo
+arquivo para comparar o tempo, e sabe de antemão quais números o dashboard deve mostrar. Para gerar
+um arquivo diferente, troque o `42` por outro número, ou use `random.Random()` sem número.
+
+### Como usar o gabarito
+
+Conte `python, java, erro, middleware` no arquivo gerado. Os totais do dashboard têm que ser
+**iguais** à contagem de referência. Se forem, fica provado que, ao passar por leitores → fila →
+workers → tópico → dashboard:
+
+- **nenhuma linha se perdeu**;
+- **nenhuma linha foi contada duas vezes**, mesmo com o trabalho dividido entre vários workers.
+
+A maiúscula do início da linha ("Python") e o ponto no fim ("sucesso.") não atrapalham: o worker
+conta sem diferenciar maiúsculas e minúsculas e só considera palavras inteiras
+([config.py#L82-L87](src/config.py#L82-L87)).
+
 ## Arquitetura (numeração do diagrama do enunciado)
 
 | # | Componente | Arquivo | Papel no MOM |
