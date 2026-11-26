@@ -416,6 +416,16 @@ contar. É nesse caso que vale abrir mais workers.
 Respostas às quatro perguntas, com link para a linha exata do código. Antes delas, dois conceitos
 que aparecem em todas as respostas: MOM e GIL.
 
+**Como usar na apresentação:** um monitor com o VS Code e o outro com este README. Cada pergunta
+tem uma **resposta curta**, uma **abertura** (falar antes da tabela), uma **tabela** para seguir
+linha a linha, um **fechamento** e respostas para as perguntas de continuação mais prováveis. Para
+cada linha da tabela:
+
+1. No VS Code, aperte **Ctrl+P** e digite o que está na coluna **Abrir** (ex.: `cliente.py:180`).
+   O arquivo abre direto na linha.
+2. Mostre o trecho da coluna **Mostrar**.
+3. Fale o texto da coluna **Fala**.
+
 ### Contexto: o que é MOM
 
 **MOM (Message-Oriented Middleware)** é um software intermediário que permite a programas trocarem
@@ -515,24 +525,35 @@ sequenceDiagram
     D->>D: concluído quando processadas == esperado
 ```
 
-Onde cada passo está no código:
+**Abertura:**
+> "A execução começa no cliente, que funciona como orquestrador. Vou seguir o caminho de uma
+> execução, do clique no botão até o dashboard mostrar 'Concluído'."
 
-| # | Passo | Código |
-|---|---|---|
-| 1 | Valida entrada e gera o `run_id` | [cliente.py#L45-L51](src/cliente.py#L45-L51) |
-| 2 | Conecta e cria a fila `dashboard.<run>` ligada ao tópico | [cliente.py#L54-L61](src/cliente.py#L54-L61) → [config.py#L54-L66](src/config.py#L54-L66) |
-| 3 | Publica `inicio.<run>` | [cliente.py#L62-L63](src/cliente.py#L62-L63) |
-| 4 | Sobe os workers (processos) | [cliente.py#L68](src/cliente.py#L68) → [cliente.py#L37-L41](src/cliente.py#L37-L41) |
-| 5 | Sobe o dashboard (processo) | [cliente.py#L72-L73](src/cliente.py#L72-L73) |
-| 6 | Sobe os 2 leitores (processos) | [cliente.py#L77-L83](src/cliente.py#L77-L83) |
-| 7 | Leitor lê linha a linha e filtra a paridade | [leitor.py#L39-L42](src/leitor.py#L39-L42) |
-| 8 | Leitor publica cada linha na fila | [leitor.py#L48-L49](src/leitor.py#L48-L49) |
-| 9 | Worker recebe, conta, publica e dá ack | [worker.py#L32-L41](src/worker.py#L32-L41) |
-| 10 | Leitor avisa o fim (`leitor_fim`) | [leitor.py#L52-L53](src/leitor.py#L52-L53) |
-| 11 | Dashboard soma e detecta o fim | [dashboard.py#L38-L60](src/dashboard.py#L38-L60) |
+| # | Abrir | Mostrar | Fala |
+|---|---|---|---|
+| 1 | [cliente.py:180](src/cliente.py#L180) | `orq.iniciar(...)` | "Quando o usuário clica em **Iniciar contagem**, a interface chama o método `iniciar` do Orquestrador, passando o arquivo, as palavras-chave e o número de workers." |
+| 2 | [cliente.py:45](src/cliente.py#L45) | validação e `run_id` (L45-51) | "Primeiro ele valida o arquivo e as palavras e gera um `run_id`, um identificador curto dessa execução. Esse id vai em todas as mensagens, para uma execução não se misturar com outra." |
+| 3 | [cliente.py:55](src/cliente.py#L55) | `conectar()` e `preparar_dashboard` (L55-61) | "Depois ele conecta no RabbitMQ e cria a fila do dashboard, já ligada ao tópico. Isso vem antes de tudo porque o tópico não guarda mensagens: se a fila ainda não existisse quando o primeiro worker publicasse, essa contagem se perderia." |
+| 4 | [config.py:54](src/config.py#L54) | `preparar_dashboard` (L54-66) | "Aqui está a criação: um `queue_declare` cria a fila `dashboard.<run_id>`, e o `queue_bind` a liga ao tópico com o padrão asterisco-ponto-run_id." |
+| 5 | [cliente.py:62](src/cliente.py#L62) | `publicar_topico(..., "inicio", ...)` | "Em seguida ele publica no tópico a mensagem `inicio`, com o arquivo e as palavras. É assim que o dashboard fica sabendo o que vai contar." |
+| 6 | [cliente.py:37](src/cliente.py#L37) | `_garantir_workers` (L37-41) | "Aí ele sobe os workers. Cada worker é um processo separado. Se já existem workers vivos de uma execução anterior, ele os reaproveita e só cria os que faltam." |
+| 7 | [cliente.py:72](src/cliente.py#L72) | abertura do dashboard (L72-73) | "Abre o dashboard, também como processo separado, passando o `run_id`." |
+| 8 | [cliente.py:77](src/cliente.py#L77) | `for paridade in ("par", "impar")` (L77-83) | "Por último, os dois leitores: um para as linhas pares e outro para as ímpares. Eles vêm por último de propósito: quando começam a publicar, todo o resto já está pronto para receber." |
+| 9 | [leitor.py:39](src/leitor.py#L39) | laço de leitura e `basic_publish` (L39-49) | "Cada leitor lê o arquivo linha a linha, fica só com as linhas da sua paridade e publica cada uma como uma mensagem JSON na `fila_linhas`." |
+| 10 | [worker.py:32](src/worker.py#L32) | `ao_receber` (L32-41) | "O RabbitMQ entrega cada linha a um único worker. O worker conta as palavras, publica a contagem no tópico e só então confirma com o ack." |
+| 11 | [leitor.py:52](src/leitor.py#L52) | `leitor_fim` (L52-53) | "Quando chega ao fim do arquivo, cada leitor publica `leitor_fim` com o número de linhas que enviou." |
+| 12 | [dashboard.py:38](src/dashboard.py#L38) | `processar` e `concluido` (L38-60) | "O dashboard vai somando as contagens. Quando recebe os dois `leitor_fim`, ele sabe o total esperado, e a execução termina quando as linhas processadas chegam a esse total." |
 
-> **Por que a fila do dashboard é criada antes dos leitores?** O tópico não guarda mensagens. Se
-> ninguém estiver ligado a ele quando o worker publicar a primeira contagem, essa contagem se perde.
+**Fechamento:**
+> "Resumindo: o cliente prepara, os leitores produzem, a fila distribui, os workers contam, o tópico
+> difunde e o dashboard soma."
+
+**Se ele perguntar…**
+- *"Por que a fila do dashboard é criada antes dos leitores?"* → "Porque a exchange do tipo topic
+  não armazena nada. Se ninguém estiver ligado a ela no momento da publicação, a mensagem é
+  descartada."
+- *"Como o dashboard sabe que acabou, se as linhas chegam fora de ordem?"* → "Ele não depende da
+  ordem: compara quantas contagens recebeu com a soma dos totais que os dois leitores informaram."
 
 ### 2. Onde fica o código das threads
 
@@ -541,27 +562,30 @@ separado, porque em Python o GIL impede que threads rodem código Python em para
 verdade existem em dois pontos: o **dashboard**, com a thread `Assinante`, e o **cliente**, com as
 threads que repassam o log dos leitores.
 
-| Onde | O que é | Código |
-|---|---|---|
-| `dashboard.py`: classe `Assinante(threading.Thread)` | **Thread** que consome o tópico | [dashboard.py#L77-L126](src/dashboard.py#L77-L126) |
-| Onde a thread `Assinante` é iniciada | `ass.start()` | [dashboard.py#L163-L164](src/dashboard.py#L163-L164) (GUI), [dashboard.py#L135-L136](src/dashboard.py#L135-L136) (CLI) |
-| Thread principal do dashboard | loop do tkinter (`mainloop`) | [dashboard.py#L157-L280](src/dashboard.py#L157-L280) |
-| `cliente.py`: `threading.Thread(target=self._repassar)` | **Thread** por leitor, só para log | [cliente.py#L83](src/cliente.py#L83), função em [cliente.py#L88-L90](src/cliente.py#L88-L90) |
-| `cliente.py`: `_py()` com `subprocess.Popen` | cria os **processos** (workers, dashboard, leitores) | [cliente.py#L26-L27](src/cliente.py#L26-L27) |
+**Abertura:**
+> "Antes de mostrar, uma observação importante: o paralelismo da contagem **não** está em threads,
+> está em processos, por causa do GIL do Python. Threads de verdade o projeto tem em dois lugares,
+> e eu vou mostrar os dois."
 
-```python
-# dashboard.py: a thread
-class Assinante(threading.Thread):
-    def __init__(self, run_id, saida):
-        super().__init__(daemon=True)
-        ...
+| # | Abrir | Mostrar | Fala |
+|---|---|---|---|
+| 1 | [cliente.py:26](src/cliente.py#L26) | `_py` com `subprocess.Popen` | "Esta é a função que cria processos. Workers, leitores e dashboard são todos processos abertos por ela. Os workers são processos porque contar palavras é trabalho de CPU: com threads, o GIL faria elas se revezarem num núcleo só. Com processos, cada worker tem o próprio interpretador e roda em outro núcleo." |
+| 2 | [dashboard.py:77](src/dashboard.py#L77) | `class Assinante(threading.Thread)` (L77-90) | "Esta é a primeira thread: a classe `Assinante`, que herda de `threading.Thread`. Ela é `daemon`, então é encerrada junto com o programa." |
+| 3 | [dashboard.py:163](src/dashboard.py#L163) | `Assinante(...)` e `ass.start()` | "Aqui ela é criada e iniciada com `start()`. A partir deste ponto o dashboard tem duas threads: a Assinante e a principal." |
+| 4 | [dashboard.py:166](src/dashboard.py#L166) | `root = tk.Tk()` … `root.mainloop()` (L280) | "A thread principal é a da interface gráfica, o tkinter, que fica rodando no `mainloop`." |
+| 5 | [cliente.py:83](src/cliente.py#L83) | `threading.Thread(target=self._repassar)` | "A segunda thread fica no cliente: uma para cada leitor." |
+| 6 | [cliente.py:88](src/cliente.py#L88) | `_repassar` (L88-90) | "Ela só lê a saída do leitor e joga no log da janela, para a interface não travar esperando o leitor imprimir." |
 
-# cliente.py: os workers são PROCESSOS, não threads
-def _garantir_workers(self, n):
-    self.workers = [w for w in self.workers if w.poll() is None]
-    for i in range(len(self.workers), n):
-        self.workers.append(_py("worker.py", "--id", str(i + 1), ...))
-```
+**Fechamento:**
+> "Então: threads no dashboard e no cliente, para a interface não travar enquanto espera rede ou
+> processo; e processos nos workers, para ter paralelismo de verdade."
+
+**Se ele perguntar…**
+- *"Por que não threads nos workers?"* → "Por causa do GIL: no CPython só uma thread executa código
+  Python por vez dentro de um processo. Contar com regex é CPU pura, então não haveria ganho."
+- *"Então para que serve thread no Python?"* → "Para tarefas que esperam I/O, como rede e disco.
+  Enquanto espera, a thread solta o GIL e outra roda. É exatamente o caso da Assinante, que passa
+  quase o tempo todo esperando mensagem da rede."
 
 ### 3. O que eu executo nas threads
 
@@ -576,35 +600,32 @@ redesenha a tela.
               (só ela usa o pika)                   soma (Estado) e desenha
 ```
 
-| Thread | O que executa | Código |
-|---|---|---|
-| **Assinante**: `run()` | conecta, `basic_qos(500)`, `basic_consume` na fila `dashboard.<run>`, `start_consuming()` | [dashboard.py#L92-L108](src/dashboard.py#L92-L108) |
-| **Assinante**: `_ao_receber()` | tira o tipo da routing key (`contagem`, `inicio`, `leitor_fim`), põe `(chave, payload)` na `queue.Queue` e dá ack | [dashboard.py#L110-L113](src/dashboard.py#L110-L113) |
-| **Assinante**: `parar()` | encerra o consumo pedindo à própria thread do pika (`add_callback_threadsafe`) e apaga a fila | [dashboard.py#L115-L126](src/dashboard.py#L115-L126) |
-| **Principal**: `atualizar()` | `fila.get_nowait()` → `estado.processar()` → redesenha barras e progresso | [dashboard.py#L235-L272](src/dashboard.py#L235-L272) |
-| **Principal**: `Estado.processar()` | soma as contagens por palavra e por worker e calcula o total esperado | [dashboard.py#L38-L56](src/dashboard.py#L38-L56) |
-| **Cliente**: `_repassar()` | lê o `stdout` de um leitor e manda para o log da janela | [cliente.py#L88-L90](src/cliente.py#L88-L90) |
+**Abertura:**
+> "No dashboard existem dois laços que rodam para sempre: o do pika, esperando mensagens do
+> RabbitMQ, e o do tkinter, esperando eventos da janela. Os dois bloqueiam, então cada um precisa
+> da sua própria thread."
 
-```python
-# dashboard.py: o que a thread Assinante executa a cada mensagem
-def _ao_receber(self, ch, metodo, props, corpo):
-    chave = metodo.routing_key.split(".")[0]          # "contagem", "inicio", "leitor_fim"
-    self.saida.put((chave, json.loads(corpo)))        # entrega à thread da interface
-    ch.basic_ack(delivery_tag=metodo.delivery_tag)
-```
+| # | Abrir | Mostrar | Fala |
+|---|---|---|---|
+| 1 | [dashboard.py:92](src/dashboard.py#L92) | `run()` (L92-99) | "Este é o `run` da thread Assinante, ou seja, o que ela executa. Ela abre a conexão com o RabbitMQ, define o prefetch, registra o callback com `basic_consume` e entra no `start_consuming`, que fica esperando mensagens." |
+| 2 | [dashboard.py:80](src/dashboard.py#L80) | docstring (L80-81) | "Ela é a **única** thread que fala com o RabbitMQ, porque a conexão bloqueante do pika não é thread-safe. Se duas threads usassem a mesma conexão, a comunicação podia se corromper." |
+| 3 | [dashboard.py:110](src/dashboard.py#L110) | `_ao_receber` (L110-113) | "A cada mensagem, o pika chama este callback, ainda dentro da thread Assinante. Ele pega o tipo da mensagem pela routing key (`contagem`, `inicio` ou `leitor_fim`), coloca numa `queue.Queue` e dá o ack." |
+| 4 | [dashboard.py:235](src/dashboard.py#L235) | `atualizar()` (L235-250) | "Do outro lado, a thread principal executa esta função `atualizar` a cada 100 milissegundos. Ela tira da `queue.Queue` o que chegou e passa para o Estado." |
+| 5 | [dashboard.py:38](src/dashboard.py#L38) | `Estado.processar` (L38-56) | "O Estado só faz contas: soma as ocorrências de cada palavra, conta quantas linhas cada worker processou e guarda o total esperado." |
+| 6 | [dashboard.py:272](src/dashboard.py#L272) | `root.after(100, atualizar)` | "E esta linha agenda a próxima atualização. É assim que a interface fica sempre responsiva: ela nunca para esperando a rede." |
+| 7 | [dashboard.py:115](src/dashboard.py#L115) | `parar()` (L115-126) | "Para encerrar, a thread principal não pode mexer na conexão diretamente. Ela usa `add_callback_threadsafe`, que pede à própria thread do pika para apagar a fila e parar o consumo." |
+| 8 | [worker.py:32](src/worker.py#L32) | `ao_receber` do worker (L32-41) | "E nos workers, que são processos, o trabalho executado é este callback: lê o JSON, conta as palavras com regex, publica no tópico e confirma com ack." |
 
-E nos **processos** worker, o trabalho pesado é o callback `ao_receber`
-([worker.py#L32-L41](src/worker.py#L32-L41)), que conta as palavras de uma linha:
+**Fechamento:**
+> "A `queue.Queue` é a ponte entre as duas threads. Ela é thread-safe: uma thread só coloca, a outra
+> só tira, e nenhuma fica bloqueada esperando a outra."
 
-```python
-def ao_receber(ch, metodo, props, corpo):
-    msg = json.loads(corpo)
-    ...
-    contagem = config.contar_palavras(msg["texto"], cache_padroes[chave])
-    config.publicar_topico(ch, "contagem", msg["run_id"],
-                           {"linha": msg["linha"], "contagem": contagem, "worker": nome})
-    ch.basic_ack(delivery_tag=metodo.delivery_tag)   # ack DEPOIS de publicar
-```
+**Se ele perguntar…**
+- *"Por que o prefetch do dashboard é 500 e o dos workers é 100?"* → "O dashboard faz um trabalho
+  muito leve por mensagem, só colocar na fila local, então pode receber lotes maiores. O worker
+  conta com regex, e lotes menores deixam o broker equilibrar melhor a carga entre eles."
+- *"E se a Assinante cair?"* → "O `run` captura a exceção e manda uma mensagem `erro` pela mesma
+  `queue.Queue`, e a interface mostra 'Erro de conexão'."
 
 ### 4. Onde é feita a publicação
 
@@ -612,41 +633,32 @@ def ao_receber(ch, metodo, props, corpo):
 outras três (**contagem**, **inicio** e **leitor_fim**) vão para o **tópico**, pela função
 `publicar_topico` do `config.py`.
 
-| Mensagem | Quem publica | Para onde | Código |
+**Abertura:**
+> "O sistema tem quatro publicações. Uma vai para a **fila**, que é ponto a ponto, e três vão para o
+> **tópico**, que é publish/subscribe."
+
+| # | Abrir | Mostrar | Fala |
 |---|---|---|---|
-| **linha** `{run_id, linha, texto, palavras}` | leitor | **fila** `fila_linhas` (exchange padrão `""`) | [leitor.py#L48-L49](src/leitor.py#L48-L49) |
-| **contagem** `{linha, contagem, worker}` | worker | **tópico**, `contagem.<run>` | [worker.py#L39-L40](src/worker.py#L39-L40) |
-| **inicio** `{arquivo, palavras}` | cliente | **tópico**, `inicio.<run>` | [cliente.py#L62-L63](src/cliente.py#L62-L63) |
-| **leitor_fim** `{paridade, total}` | leitor | **tópico**, `leitor_fim.<run>` | [leitor.py#L52-L53](src/leitor.py#L52-L53) |
+| 1 | [leitor.py:31](src/leitor.py#L31) | `conectar()` e `channel()` (L31-33) | "No pika não existe um objeto 'publisher'. Publicar é chamar `basic_publish` num canal. Então o leitor abre a conexão, abre um canal e garante que a fila existe." |
+| 2 | [leitor.py:35](src/leitor.py#L35) | `delivery_mode=2` | "Aqui eu defino que as mensagens são persistentes, `delivery_mode` 2: o broker grava em disco." |
+| 3 | [leitor.py:48](src/leitor.py#L48) | `basic_publish(exchange="", ...)` | "Esta é a publicação na **fila**. A exchange vazia é a exchange padrão do RabbitMQ: ela entrega direto na fila que tem o mesmo nome da routing key, a `fila_linhas`. Cada linha vai para um único worker." |
+| 4 | [config.py:69](src/config.py#L69) | `publicar_topico` (L69-74) | "As outras três publicações passam por esta função. Ela publica no `topico_palavras`, que é uma exchange do tipo topic. A routing key é o tipo da mensagem, um ponto e o `run_id`, e o corpo vai em JSON." |
+| 5 | [worker.py:39](src/worker.py#L39) | `"contagem"` (L39-40) | "O worker publica `contagem`: o número da linha, quantas vezes cada palavra apareceu e o nome do worker." |
+| 6 | [cliente.py:62](src/cliente.py#L62) | `"inicio"` (L62-63) | "O cliente publica `inicio`, com o arquivo e as palavras-chave." |
+| 7 | [leitor.py:52](src/leitor.py#L52) | `"leitor_fim"` (L52-53) | "E o leitor publica `leitor_fim`, com quantas linhas enviou." |
+| 8 | [config.py:65](src/config.py#L65) | `queue_bind(..., routing_key=f"*.{run_id}")` | "Quem recebe essas três é a fila do dashboard, ligada ao tópico com o padrão asterisco-ponto-run_id. O asterisco casa exatamente uma palavra, então ela recebe as três mensagens desta execução e nenhuma de outra execução." |
 
-Publicação na **fila** (leitor). `exchange=""` é a exchange padrão do RabbitMQ: ela entrega direto
-na fila cujo nome é igual à `routing_key`:
+**Fechamento:**
+> "A fila divide o **trabalho**: cada linha vai para um worker. O tópico difunde a **informação**:
+> cada resultado vai para todos os assinantes. Se amanhã eu quiser gravar os resultados num banco,
+> basta criar outra fila ligada ao tópico, sem mexer no worker."
 
-```python
-propriedades = pika.BasicProperties(delivery_mode=2)  # mensagem persistente
-...
-canal.basic_publish(exchange="", routing_key=config.FILA_LINHAS,
-                    body=corpo, properties=propriedades)
-```
-
-Publicação no **tópico** ([config.py#L69-L74](src/config.py#L69-L74)), usada por worker, cliente e
-leitor:
-
-```python
-def publicar_topico(canal, chave, run_id, payload):
-    canal.basic_publish(
-        exchange=TOPICO,                         # "topico_palavras", tipo topic
-        routing_key=f"{chave}.{run_id}",         # ex.: contagem.ab12cd34
-        body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-    )
-```
-
-A fila e o tópico são declarados em [config.py#L44-L47](src/config.py#L44-L47). Quem **assina** o
-tópico é a fila `dashboard.<run>`, ligada com o padrão `*.<run>` em
-[config.py#L64-L65](src/config.py#L64-L65).
-
-> **Fila × tópico:** na fila, cada linha vai para **um** worker (o trabalho é dividido). No tópico,
-> a mensagem vai para **todas** as filas ligadas (a informação é difundida).
+**Se ele perguntar…**
+- *"Por que o ack vem depois do publish?"* → "Se o worker morrer entre os dois, a linha não foi
+  confirmada e o broker a entrega de novo a outro worker. Então nenhuma linha fica sem contagem. O
+  custo é que, nesse caso raro, a linha pode ser contada duas vezes: a entrega é *at-least-once*."
+- *"Por que exchange vazia no leitor e não o tópico?"* → "Porque a linha é trabalho, e trabalho deve
+  ir para um único consumidor. Se fosse pelo tópico, cada assinante receberia uma cópia."
 
 ### 5. Onde cada peça é instanciada
 
