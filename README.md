@@ -156,6 +156,261 @@ conta sem diferenciar maiúsculas e minúsculas e só considera palavras inteira
 
 ---
 
+## Como funciona o paralelismo
+
+**Resposta curta:** cada worker é um **processo** separado, e todos consomem a **mesma fila**. O
+broker entrega cada linha a um único worker, então N workers contam N lotes de linhas **ao mesmo
+tempo**, em núcleos diferentes da CPU. Nenhum código do projeto divide o trabalho: quem divide é o
+RabbitMQ.
+
+O paralelismo vem de três mecanismos que trabalham juntos.
+
+### 1. Processos, não threads
+
+O cliente abre cada worker como um **processo** do sistema operacional
+([cliente.py#L37-L41](src/cliente.py#L37-L41)):
+
+```python
+for i in range(len(self.workers), n):
+    self.workers.append(_py("worker.py", "--id", str(i + 1), ...))   # _py = subprocess.Popen
+```
+
+**Por que processos?** Por causa do **GIL** do Python (veja [o que é GIL](#contexto-o-que-é-gil)).
+Dentro de um processo, só uma thread executa código Python por vez. Contar palavras com regex é
+trabalho de CPU, então 3 threads se revezariam num núcleo só. Já 3 processos têm 3 interpretadores
+e 3 GILs, e o sistema operacional os coloca em 3 núcleos ao mesmo tempo.
+
+```
+ Threads (não usado)                 Processos (usado)
+ ┌──────── 1 processo ────────┐      ┌─ processo ─┐ ┌─ processo ─┐ ┌─ processo ─┐
+ │  GIL: uma thread por vez   │      │  worker-1  │ │  worker-2  │ │  worker-3  │
+ │  T1 ▓▓░░░░▓▓░░░░           │      │  ▓▓▓▓▓▓▓▓  │ │  ▓▓▓▓▓▓▓▓  │ │  ▓▓▓▓▓▓▓▓  │
+ │  T2 ░░▓▓░░░░▓▓░░           │      │  núcleo 1  │ │  núcleo 2  │ │  núcleo 3  │
+ │  T3 ░░░░▓▓░░░░▓▓           │      └────────────┘ └────────────┘ └────────────┘
+ └────────────────────────────┘
+```
+
+### 2. Competing consumers: o broker divide o trabalho
+
+Todos os workers fazem `basic_consume` na **mesma fila** ([worker.py#L43](src/worker.py#L43)):
+
+```python
+canal.basic_consume(queue=config.FILA_LINHAS, on_message_callback=ao_receber)
+```
+
+Quando vários consumidores leem a mesma fila, o RabbitMQ entrega **cada mensagem a um só deles**,
+revezando (*round-robin*). Esse padrão se chama **competing consumers** (consumidores concorrentes):
+os workers "competem" pelas linhas. Por isso:
+
+- **nenhum worker sabe dos outros**, e não há código de divisão, índice ou coordenação;
+- para ter mais paralelismo, **basta abrir mais workers**, sem mudar nada no código;
+- se um worker morrer, os outros continuam, e as linhas que ele não confirmou (ack) voltam para a
+  fila.
+
+### 3. Prefetch: lotes em vez de uma linha por vez
+
+```python
+canal.basic_qos(prefetch_count=100)     # worker.py#L28
+```
+
+O prefetch diz ao broker: "mande até **100 linhas sem ack** para este worker". Isso tem dois
+efeitos:
+
+- **Menos idas e vindas:** o worker já tem as próximas linhas na mão, em vez de pedir uma por uma
+  pela rede.
+- **Divisão justa:** o broker só manda mais linhas quando o worker confirma as anteriores. Um worker
+  mais lento recebe menos, e os mais rápidos pegam o resto. A carga se ajusta sozinha.
+
+Sem `basic_qos`, o broker repartiria as linhas num rodízio cego: cada worker receberia a mesma
+quantidade, fosse rápido ou lento, e todas as linhas se acumulariam na memória dos workers. Os
+detalhes estão em [Round-robin](#round-robin-como-o-broker-reparte-as-linhas).
+
+A demo deve usar um **arquivo grande**. Na primeira execução, os workers são abertos junto com os
+leitores, e o primeiro worker a se conectar já pode levar 100 linhas de uma vez. Com um arquivo
+pequeno, ele pode fazer quase tudo sozinho, e a demo parece não ter paralelismo.
+
+### Além dos workers: as etapas também rodam ao mesmo tempo
+
+Os leitores, os workers e o dashboard são processos separados, e as linhas passam pela fila como
+numa **linha de montagem**. Ninguém espera a etapa anterior terminar:
+
+```
+tempo ─────────────────────────────────────────────────────────▶
+leitor ímpar  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+leitor par    ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+worker-1        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+worker-2        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+worker-3        ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+dashboard         ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓
+```
+
+Enquanto os leitores ainda leem o fim do arquivo, os workers já contam as primeiras linhas e o
+dashboard já está somando.
+
+### Por que o resultado sai certo, mesmo fora de ordem
+
+Os workers terminam as linhas em **qualquer ordem**: a linha 7 pode chegar ao dashboard antes da
+linha 2. Isso não importa, porque o dashboard só **soma**, e a ordem das parcelas não muda a soma.
+O número da linha vai na mensagem só para rastreio.
+
+O que importa é que **cada linha seja contada uma vez**, e isso a fila garante: cada mensagem vai
+para um único worker e só sai da fila depois do ack. A única exceção é rara: se um worker morrer
+**depois** de publicar a contagem e **antes** do ack, a linha volta para a fila e é contada duas
+vezes (veja *Limitações conhecidas*).
+
+### O que **não** é paralelo
+
+Vale saber para não ser pego de surpresa:
+
+- **Os dois leitores não dividem a leitura do disco.** Cada um lê o arquivo **inteiro** e descarta
+  as linhas da outra paridade. A divisão par/ímpar é exigência do enunciado. Ler é barato comparado
+  a contar, então isso pesa pouco.
+- **O dashboard é um só.** Ele recebe e soma todas as contagens sozinho, mas somar números é muito
+  mais leve que aplicar regex.
+- **O ganho não é proporcional.** 3 workers não deixam a execução exatamente 3× mais rápida: cada
+  linha também passa pela rede, é convertida para JSON e é confirmada no broker, e essa parte custa
+  o mesmo com 1 ou com 3 workers.
+
+### Como ver o paralelismo acontecendo
+
+| Onde | O que olhar |
+|---|---|
+| **Dashboard** | O quadro "Linhas processadas por worker" mostra cada worker com uma parte parecida do total |
+| **Dashboard** | O campo "linhas/s": rode o mesmo arquivo com 1 worker e depois com 3, e compare |
+| **RabbitMQ** (http://localhost:15672) | Aba **Queues**: `fila_linhas` com *Consumers = 3* |
+| **RabbitMQ** | Aba **Channels**: cada worker com *Prefetch 100* e linhas *Unacked* |
+| **Terminal** (`htop` ou `top`) | 3 processos `python worker.py` usando CPU ao mesmo tempo |
+
+O mesmo arquivo gerado por [gerar_arquivo.py](scripts/gerar_arquivo.py) dá sempre o mesmo
+gabarito, então os totais têm que bater com 1, 3 ou 10 workers. Esse é o teste de que o paralelismo
+não perdeu nem duplicou linhas.
+
+## Round-robin: como o broker reparte as linhas
+
+**Resposta curta:** o RabbitMQ entrega as linhas da `fila_linhas` aos workers **em rodízio**
+(worker-1, worker-2, worker-3, worker-1…), mas **pula quem está cheio**. "Cheio" quer dizer ter 100
+linhas recebidas e ainda não confirmadas (o `prefetch`). Então, no começo, a divisão é um rodízio
+certinho. Depois, quem confirma (ack) primeiro recebe a próxima linha, e o worker mais rápido acaba
+fazendo mais.
+
+### As três linhas de código envolvidas
+
+Todas ficam no [worker.py](src/worker.py):
+
+```python
+canal.basic_qos(prefetch_count=100)                                     # L28: limite de linhas sem ack
+canal.basic_consume(queue=config.FILA_LINHAS, on_message_callback=...)  # L43: entra no rodízio
+ch.basic_ack(delivery_tag=metodo.delivery_tag)                          # L41: "terminei", libera uma vaga
+```
+
+- `basic_consume` registra o worker como **consumidor** da fila. O broker guarda a lista de
+  consumidores e faz o rodízio entre eles.
+- `basic_qos(prefetch_count=100)` dá a cada worker **100 vagas**: no máximo 100 linhas entregues e
+  ainda não confirmadas.
+- `basic_ack` confirma uma linha. Ela sai da fila de vez e **libera uma vaga** para o broker mandar
+  outra.
+
+### O que o broker faz quando chega uma linha
+
+```
+ chegou uma linha na fila_linhas
+              │
+              ▼
+ próximo worker do rodízio ──▶ tem vaga (menos de 100 sem ack)?
+              ▲                       │               │
+              │                      sim             não
+              │                       │               │
+              │                       ▼               ▼
+              │              entrega a linha    pula para o próximo
+              │              a esse worker             │
+              │                                        │
+              └────────────────────────────────────────┘
+       (se ninguém tem vaga, a linha espera na fila como "Ready")
+```
+
+### Um exemplo acompanhado passo a passo
+
+Para o exemplo caber aqui: **3 workers**, **prefetch = 2** (no projeto é 100) e **9 linhas**
+(L1 a L9).
+
+**Fase 1: rodízio certinho, até todos lotarem.** As linhas chegam e o broker as entrega em ordem
+de rodízio:
+
+| Linha | Vai para | Linhas sem ack (w1 / w2 / w3) |
+|---|---|---|
+| L1 | worker-1 | 1 / 0 / 0 |
+| L2 | worker-2 | 1 / 1 / 0 |
+| L3 | worker-3 | 1 / 1 / 1 |
+| L4 | worker-1 | 2 / 1 / 1 |
+| L5 | worker-2 | 2 / 2 / 1 |
+| L6 | worker-3 | 2 / 2 / 2 ← **todos cheios** |
+| L7, L8, L9 | **ficam na fila** (*Ready*) | ninguém tem vaga |
+
+**Fase 2: quem confirma primeiro recebe a próxima.** Agora a velocidade de cada worker é que
+decide. Suponha que o worker-2 seja o mais rápido e o worker-3 o mais lento:
+
+| Acontecimento | O broker faz | Linhas sem ack (w1 / w2 / w3) |
+|---|---|---|
+| worker-2 dá ack em L2 | manda **L7** para o worker-2 | 2 / 2 / 2 |
+| worker-1 dá ack em L1 | manda **L8** para o worker-1 | 2 / 2 / 2 |
+| worker-2 dá ack em L5 | manda **L9** para o worker-2 | 2 / 2 / 2 |
+| fila vazia, os workers confirmam o que restou | (nada a mandar) | 0 / 0 / 0 |
+
+**Resultado:**
+
+| Worker | Linhas | Total |
+|---|---|---|
+| worker-1 | L1, L4, L8 | 3 |
+| worker-2 (mais rápido) | L2, L5, L7, L9 | **4** |
+| worker-3 (mais lento) | L3, L6 | **2** |
+
+O rodízio começou igual para todos, mas **o trabalho se ajustou à velocidade** de cada worker. É por
+isso que, no dashboard, os números por worker ficam **parecidos, mas não idênticos**.
+
+### Com e sem prefetch
+
+| | Sem `basic_qos` (rodízio cego) | Com `prefetch_count=100` (o projeto) |
+|---|---|---|
+| Como reparte | rigorosamente 1, 2, 3, 1, 2, 3… | rodízio, pulando quem tem 100 linhas sem ack |
+| Worker lento | recebe a **mesma quantidade** e atrasa o fim de tudo | recebe **menos**, e os outros compensam |
+| Onde ficam as linhas esperando | na memória dos workers | **na fila do broker** |
+| Se um worker morrer | todas as linhas que ele tinha recebido voltam para a fila | no máximo 100 voltam |
+
+E por que **100**, e não 1?
+
+- **Prefetch 1** dá a divisão mais justa possível, mas o worker fica parado esperando a rede a cada
+  linha (confirma, espera chegar a próxima, conta, confirma…).
+- **Prefetch 100** mantém sempre linhas "na mão" do worker, que nunca fica ocioso, e ainda deixa o
+  broker equilibrar a carga.
+
+### Detalhes que fazem diferença
+
+- **O rodízio é por mensagem, não por paridade.** Não existe "worker das linhas pares". Os dois
+  leitores publicam na mesma fila, as linhas pares e ímpares se misturam ali, e o rodízio pega
+  qualquer uma.
+- **Só entra no rodízio quem já está conectado.** Na primeira execução, os workers e os leitores
+  são abertos quase juntos, e o worker que se conecta primeiro pode já levar 100 linhas antes de os
+  outros chegarem. Com arquivo grande isso não importa; com arquivo pequeno, a divisão fica
+  desigual.
+- **Ordem das linhas.** Cada worker processa as suas em ordem, mas, entre workers diferentes, as
+  contagens chegam ao dashboard fora de ordem. Como o dashboard só soma, o resultado não muda.
+
+### Onde ver no RabbitMQ (http://localhost:15672)
+
+Durante uma execução com arquivo grande e 3 workers:
+
+| Aba | O que olhar | O que significa |
+|---|---|---|
+| **Queues** → `fila_linhas` | *Consumers* = 3 | os 3 workers estão no rodízio |
+| **Queues** → `fila_linhas` | *Unacked* até 300 | 3 workers × 100 linhas de prefetch |
+| **Queues** → `fila_linhas` | *Ready* | linhas esperando porque todos os workers estão cheios |
+| **Channels** | *Prefetch* = 100 e *Unacked* em cada canal | quanto cada worker está segurando agora |
+
+Se *Ready* fica crescendo, os leitores estão publicando mais rápido do que os workers conseguem
+contar. É nesse caso que vale abrir mais workers.
+
+---
+
 ## Perguntas da apresentação
 
 Respostas às quatro perguntas, com link para a linha exata do código. Antes delas, dois conceitos
