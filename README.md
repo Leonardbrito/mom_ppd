@@ -561,6 +561,174 @@ contar. É nesse caso que vale abrir mais workers.
 
 ---
 
+## Roteiro da demonstração ao vivo
+
+Sequência para mostrar a aplicação funcionando, com **o que fazer** e **o que falar** em cada passo.
+Faça a demonstração **antes** de entrar no código: depois de ver a aplicação rodando, o professor
+entende melhor cada trecho que você mostrar.
+
+### Antes da apresentação (preparação)
+
+Faça isto antes de o professor chegar e **ensaie a demonstração inteira uma vez**:
+
+```bash
+docker compose up -d                       # sobe o broker
+docker compose ps                          # espere aparecer "healthy"
+source .venv/bin/activate                  # ativa a venv
+```
+
+Deixe abertos: **um terminal** na pasta do projeto, o **painel do RabbitMQ**
+(http://localhost:15672, `guest`/`guest`) e o **VS Code**.
+
+Os números esperados do arquivo de 200 mil linhas (gabarito do `gerar_arquivo.py`) são:
+
+| python | java | erro | middleware |
+|---|---|---|---|
+| 95.909 | 96.307 | 95.881 | 95.820 |
+
+### Passo 1: gerar o dataset
+
+**Fazer:**
+
+```bash
+python scripts/gerar_arquivo.py 200000 data/entrada.txt
+head -3 data/entrada.txt
+```
+
+**Falar:**
+> "Primeiro eu gero o dataset. Esse script cria um arquivo com 200 mil linhas, cada uma com 5 a 20
+> palavras sorteadas de um vocabulário fixo. Como a semente do sorteio é fixa, o arquivo sai sempre
+> igual. E, enquanto gera, o script já conta as palavras e imprime esta contagem de referência, que
+> é o nosso **gabarito**. No fim, o dashboard tem que mostrar exatamente estes números."
+
+Aponte a linha "Contagem de referência" no terminal e deixe esses números visíveis.
+
+### Passo 2: mostrar o broker
+
+**Fazer:** no painel do RabbitMQ, abra a aba **Exchanges** e depois a aba **Queues**.
+
+**Falar:**
+> "Este é o RabbitMQ, o broker, rodando num container Docker. Ele é o intermediário: nenhum programa
+> fala direto com outro, todos falam com ele. Aqui está o `topico_palavras`, a exchange do tipo
+> topic por onde passam os resultados. A fila de linhas, a `fila_linhas`, é onde os leitores vão
+> colocar o trabalho."
+
+### Passo 3: abrir o cliente
+
+**Fazer:**
+
+```bash
+python src/cliente.py
+```
+
+**Falar:**
+> "Este é o cliente, o ponto de partida da aplicação. Ele pede três coisas: o arquivo de entrada, as
+> palavras-chave que eu quero contar e quantos workers vão trabalhar em paralelo."
+
+### Passo 4: preencher a interface
+
+**Fazer:**
+- **Arquivo de entrada:** clique em **Procurar…** e escolha `data/entrada.txt`.
+- **Palavras-chave:** `python, java, erro, middleware`
+- **Workers:** `3`
+
+**Falar:**
+> "Escolho o arquivo que acabei de gerar, as mesmas quatro palavras do gabarito e 3 workers. Cada
+> worker vai ser um processo separado do sistema operacional, então os três vão contar ao mesmo
+> tempo, em núcleos diferentes."
+
+### Passo 5: clicar em "Iniciar contagem" e ler o log
+
+**Fazer:** clique em **▶ Iniciar contagem**. Aponte cada linha que aparecer no **Log**:
+
+| Linha do log | Falar |
+|---|---|
+| `Execução ab12cd34: palavras = python, java, erro, middleware` | "O cliente gerou um identificador para esta execução, criou no broker a fila do dashboard já ligada ao tópico e publicou a mensagem de início." |
+| `3 worker(s) ativo(s)` | "Subiu os 3 workers. Eles se conectam ao broker e ficam esperando linhas na fila." |
+| `Dashboard aberto` | "Abriu o dashboard, que é quem vai receber os resultados." |
+| `Leitores de linhas pares e ímpares iniciados` | "E, por último, os dois leitores." |
+| `[leitor impar] iniciado` / `[leitor par] iniciado` | "Os dois leitores leem o mesmo arquivo: um fica com as linhas ímpares e o outro com as pares. Assim o dataset é dividido em dois conjuntos. Cada leitor publica as suas linhas, uma por uma, na **mesma** fila." |
+| `[leitor impar] terminou: 100000 linhas enviadas` | "Cada leitor enviou 100 mil linhas, metade do arquivo, e avisou o total pelo tópico. É assim que o dashboard sabe quantas linhas esperar." |
+
+Um cuidado na fala: os conjuntos par e ímpar **não vão para workers diferentes**. Os dois leitores
+publicam na mesma fila, as linhas se misturam ali, e qualquer worker pode pegar qualquer linha. Se o
+professor perguntar, explique:
+> "A divisão par/ímpar é na leitura. A divisão entre os workers quem faz é o broker, em rodízio."
+
+### Passo 6: acompanhar o dashboard
+
+**Fazer:** aponte cada parte da janela do dashboard enquanto ela atualiza:
+
+| Parte da janela | Falar |
+|---|---|
+| Status **"Processando… (leitores ainda lendo o arquivo)"** e barra em movimento | "Os workers já estão contando enquanto os leitores ainda leem. As etapas rodam ao mesmo tempo, como numa linha de montagem." |
+| Barra de progresso ficando **determinada** ("X de 200.000 linhas") | "Quando os dois leitores avisaram o total, o dashboard passou a saber quantas linhas esperar, e a barra mostra o progresso real." |
+| **"Ocorrências por palavra-chave"** (barras crescendo) | "Cada worker publica no tópico a contagem de uma linha, e o dashboard, que assina o tópico, vai somando." |
+| **"Linhas processadas por worker"** | "Esta é a prova do paralelismo: os três workers processaram partes parecidas do arquivo. O broker repartiu as linhas entre eles, sem nenhum código de divisão." |
+| **linhas/s** | "Esta é a vazão, quantas linhas por segundo o sistema está processando." |
+
+### Passo 7: mostrar o broker durante a execução
+
+Se a execução terminar rápido demais, rode de novo só para este passo.
+
+**Fazer:** volte ao painel do RabbitMQ, aba **Queues**, e clique em `fila_linhas`.
+
+**Falar:**
+> "Aqui a `fila_linhas` mostra **3 consumidores**, que são os 3 workers lendo a mesma fila. A coluna
+> *Unacked* mostra as linhas que os workers já pegaram e ainda não confirmaram: cada um segura até
+> 100, que é o prefetch. Esta outra fila, `dashboard.<id>`, é a fila do dashboard ligada ao tópico."
+
+### Passo 8: concluir e conferir com o gabarito
+
+**Fazer:** espere o status **"✔ Concluído"** e compare os totais com o gabarito do Passo 1.
+
+**Falar:**
+> "Concluído. Os totais batem exatamente com o gabarito: python 95.909, java 96.307, erro 95.881 e
+> middleware 95.820. Isso mostra que as 200 mil linhas passaram por leitores, fila, workers, tópico e
+> dashboard sem nenhuma se perder e sem nenhuma ser contada duas vezes, mesmo divididas entre três
+> processos."
+
+### Extras (se houver tempo)
+
+**A) Comparar 1 worker com 3.** Os workers continuam vivos entre execuções, e o cliente só **cria**
+os que faltam, nunca encerra os que sobram. Por isso a ordem importa:
+
+1. Feche o cliente (isso encerra os workers) e abra de novo.
+2. Rode com **1 worker** e anote o **linhas/s**.
+3. Na mesma janela, rode com **3 workers** (o cliente cria mais 2) e compare.
+
+> "Com 3 workers a vazão sobe. Não fica exatamente 3 vezes maior, porque cada linha também passa
+> pela rede e pelo broker, e essa parte não se divide."
+
+**B) Matar um worker no meio.** É o teste que mais impressiona, mas **ensaie antes**. Se 200 mil
+linhas terminarem rápido demais, gere um arquivo maior (ex.: `1000000`).
+
+```bash
+pgrep -af worker.py        # mostra os PIDs dos workers
+kill <PID de um deles>     # durante a contagem
+```
+
+> "Matei um worker no meio da contagem. As linhas que ele tinha pego e não tinha confirmado voltaram
+> para a fila, e os outros dois terminaram o trabalho. O total continua batendo com o gabarito."
+
+No dashboard, o contador desse worker para de subir, e os outros continuam.
+
+Existe um caso raro: se o worker morrer **entre** publicar uma contagem e dar o ack, aquela linha é
+contada duas vezes, e o total sai 1 ou 2 acima do gabarito. Se acontecer, explique que a entrega é
+*at-least-once* (veja *Limitações conhecidas*).
+
+### Fala de encerramento
+
+> "Resumindo o que vocês viram: os leitores dividiram o arquivo em linhas pares e ímpares e as
+> colocaram numa fila. O broker repartiu essas linhas entre três workers, que contaram em paralelo e
+> publicaram os resultados num tópico. O dashboard assinou esse tópico e somou tudo. A fila dividiu
+> o **trabalho**, e o tópico difundiu a **informação**. Agora eu mostro onde cada coisa está no
+> código."
+
+Daí em diante, siga as perguntas abaixo.
+
+---
+
 ## Perguntas da apresentação
 
 Respostas às quatro perguntas, com link para a linha exata do código. Antes delas, dois conceitos
