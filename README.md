@@ -18,6 +18,21 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt   # tkinter
 ./.venv/bin/python src/cliente.py            # interface gráfica
 ```
 
+### Ativando a venv (opcional)
+
+Os comandos acima chamam `./.venv/bin/python` direto e funcionam sem ativar nada. Se preferir
+digitar só `python`, ative a venv uma vez por terminal:
+
+```bash
+source .venv/bin/activate      # Linux/macOS (o prompt passa a mostrar "(.venv)")
+# .venv\Scripts\activate       # Windows
+
+python scripts/gerar_arquivo.py 200000 data/entrada.txt
+python src/cliente.py
+
+deactivate                     # para sair da venv
+```
+
 Sem interface (útil para testar): `python src/cliente.py --cli -a data/entrada.txt -p python,java,erro -w 3`.
 Painel do broker: http://localhost:15672 (guest/guest). Outro host: variável `RABBITMQ_HOST`.
 
@@ -307,3 +322,179 @@ tópico é a fila `dashboard.<run>`, ligada com o padrão `*.<run>` em
 
 > **Fila × tópico:** na fila, cada linha vai para **um** worker (o trabalho é dividido). No tópico,
 > a mensagem vai para **todas** as filas ligadas (a informação é difundida).
+
+### 5. Onde cada peça é instanciada
+
+**Resumo:**
+
+| O quê | Onde |
+|---|---|
+| Cliente | `Orquestrador()` em [cliente.py#L114](src/cliente.py#L114) |
+| Leitores | `for paridade in ("par", "impar")` em [cliente.py#L78](src/cliente.py#L78) |
+| Nº de workers | campo na interface em [cliente.py#L157](src/cliente.py#L157) → `_garantir_workers` em [cliente.py#L37](src/cliente.py#L37) |
+| Fila de linhas | `queue_declare` em [config.py#L46](src/config.py#L46) |
+| Fila do dashboard | `queue_declare` + `queue_bind` em [config.py#L64-L65](src/config.py#L64-L65) |
+| Publisher (leitor → fila) | `basic_publish` em [leitor.py#L48](src/leitor.py#L48) |
+| Publisher (worker → tópico) | `publicar_topico` em [worker.py#L39](src/worker.py#L39) → [config.py#L70](src/config.py#L70) |
+| Subscribe do dashboard | ligação: `queue_bind` em [config.py#L65](src/config.py#L65); consumo: `basic_consume` em [dashboard.py#L98](src/dashboard.py#L98) |
+
+#### Cliente
+
+A aplicação começa em [cliente.py#L203-L215](src/cliente.py#L203-L215): sem `--cli` abre a janela,
+com `--cli` roda no terminal.
+
+```python
+if __name__ == "__main__":
+    ...
+    if a.cli:
+        rodar_cli(a)        # sem janela
+    else:
+        rodar_gui()         # janela tkinter (padrão)
+```
+
+O "cliente" de fato é um objeto da classe `Orquestrador` ([cliente.py#L30](src/cliente.py#L30)). Ele
+é criado em [cliente.py#L114](src/cliente.py#L114) na interface gráfica, ou em
+[cliente.py#L101](src/cliente.py#L101) no modo CLI:
+
+```python
+orq = Orquestrador()
+```
+
+O botão **"Iniciar contagem"** chama `orq.iniciar(...)` ([cliente.py#L180](src/cliente.py#L180)).
+É esse método ([cliente.py#L43-L85](src/cliente.py#L43-L85)) que dispara todo o resto.
+
+#### Leitores de linhas
+
+Em [cliente.py#L77-L83](src/cliente.py#L77-L83), um `for` cria **2 processos**, um por paridade:
+
+```python
+for paridade in ("par", "impar"):
+    p = _py("leitor.py", "--arquivo", ..., "--paridade", paridade,
+            "--run-id", run_id, "--palavras", ",".join(palavras), ...)
+```
+
+A função `_py` ([cliente.py#L26-L27](src/cliente.py#L26-L27)) é um `subprocess.Popen`, ou seja, abre
+`python leitor.py ...` como processo separado. Dentro do leitor, a paridade vira o filtro
+([leitor.py#L29](src/leitor.py#L29) e [leitor.py#L40-L42](src/leitor.py#L40-L42)):
+
+```python
+resto = 0 if args.paridade == "par" else 1
+for numero, linha in enumerate(f, start=1):
+    if numero % 2 != resto:
+        continue
+```
+
+#### Número de workers
+
+**O número vem do usuário:**
+
+- Na interface, o campo `Spinbox` com valor inicial 3, em [cliente.py#L156-L159](src/cliente.py#L156-L159).
+- Na linha de comando, `-w`, também com padrão 3, em [cliente.py#L208](src/cliente.py#L208).
+
+**Esse número chega aos workers por este caminho:**
+
+1. `orq.iniciar(..., var_w.get())` em [cliente.py#L180](src/cliente.py#L180)
+2. → `self._garantir_workers(n_workers)` em [cliente.py#L68](src/cliente.py#L68)
+3. → [cliente.py#L37-L41](src/cliente.py#L37-L41)
+
+```python
+def _garantir_workers(self, n):
+    self.workers = [w for w in self.workers if w.poll() is None]   # descarta os que morreram
+    for i in range(len(self.workers), n):                          # cria só os que faltam
+        self.workers.append(_py("worker.py", "--id", str(i + 1), ...))
+```
+
+Cada worker é um processo `python worker.py --id 1`, `--id 2`, `--id 3`. Os workers continuam vivos
+entre uma execução e outra: o cliente reaproveita os que já existem e só cria os que faltam.
+
+#### Filas
+
+O projeto tem **duas** filas, e as duas são criadas em [config.py](src/config.py).
+
+**`fila_linhas`, a fila de trabalho.** O nome está em [config.py#L28](src/config.py#L28), e ela é
+criada em [config.py#L44-L47](src/config.py#L44-L47):
+
+```python
+def declarar_base(canal):
+    canal.queue_declare(queue=FILA_LINHAS, durable=True)                          # a fila
+    canal.exchange_declare(exchange=TOPICO, exchange_type="topic", durable=True)  # o tópico
+```
+
+Quem chama essa função: o leitor ([leitor.py#L33](src/leitor.py#L33)), o worker
+([worker.py#L27](src/worker.py#L27)) e o cliente (via `preparar_dashboard`). O `queue_declare` é
+**idempotente**: se a fila já existe, não faz nada. Por isso todos podem chamar, sem importar quem
+chega primeiro.
+
+**`dashboard.<run>`, a fila do assinante.** É criada em [config.py#L54-L66](src/config.py#L54-L66) e
+chamada pelo cliente em [cliente.py#L61](src/cliente.py#L61):
+
+```python
+canal.queue_declare(queue=fila, durable=False, arguments={"x-expires": 3_600_000})
+canal.queue_bind(queue=fila, exchange=TOPICO, routing_key=f"*.{run_id}")
+```
+
+#### Publisher
+
+No pika **não existe um objeto "Publisher"**. Publicar é chamar `basic_publish` num **canal**.
+"Instanciar o publisher", aqui, significa abrir a conexão e o canal:
+
+```python
+conn = config.conectar()    # config.py#L32-L41: pika.BlockingConnection(...)
+canal = conn.channel()
+```
+
+Há **dois publishers principais**:
+
+**Leitor, o produtor da fila.** Conexão e canal em [leitor.py#L31-L32](src/leitor.py#L31-L32),
+publicação em [leitor.py#L48-L49](src/leitor.py#L48-L49):
+
+```python
+propriedades = pika.BasicProperties(delivery_mode=2)   # mensagem persistente (leitor.py#L35)
+canal.basic_publish(exchange="", routing_key=config.FILA_LINHAS,
+                    body=corpo, properties=propriedades)
+```
+
+**Worker, o publisher do tópico.** Conexão e canal em [worker.py#L25-L26](src/worker.py#L25-L26),
+publicação em [worker.py#L39-L40](src/worker.py#L39-L40):
+
+```python
+config.publicar_topico(ch, "contagem", msg["run_id"], {...})
+```
+
+que, por dentro ([config.py#L69-L74](src/config.py#L69-L74)), faz:
+
+```python
+canal.basic_publish(exchange=TOPICO, routing_key=f"{chave}.{run_id}", body=json...)
+```
+
+O tópico também recebe as publicações do cliente (`inicio`, [cliente.py#L62](src/cliente.py#L62)) e
+do leitor (`leitor_fim`, [leitor.py#L52](src/leitor.py#L52)).
+
+#### Subscribe do dashboard
+
+O subscribe tem **duas metades**, e cada uma fica num arquivo diferente.
+
+**a) A assinatura no broker, feita pelo cliente.** O `queue_bind` em
+[config.py#L65](src/config.py#L65) diz ao RabbitMQ: "tudo o que chegar no `topico_palavras` com
+routing key `*.<run>` vai para a fila `dashboard.<run>`". Isso é o subscribe propriamente dito.
+
+O cliente faz isso **antes** de abrir o dashboard e os leitores. O tópico não guarda mensagens,
+então se a ligação não existisse quando o worker publicasse, a contagem se perderia.
+
+**b) O consumo, feito pelo dashboard.** O processo do dashboard é aberto em
+[cliente.py#L72-L73](src/cliente.py#L72-L73). Dentro dele, a thread `Assinante` é criada e iniciada
+em [dashboard.py#L163-L164](src/dashboard.py#L163-L164), e o `run()` dela
+([dashboard.py#L92-L99](src/dashboard.py#L92-L99)) faz:
+
+```python
+self.conn = config.conectar()
+self.canal = self.conn.channel()
+fila = config.nome_fila_dashboard(self.run_id)            # "dashboard.<run>"
+self.canal.basic_qos(prefetch_count=500)
+self.canal.basic_consume(queue=fila, on_message_callback=self._ao_receber)
+self.canal.start_consuming()                              # fica esperando mensagens
+```
+
+A cada mensagem, o pika chama `_ao_receber` ([dashboard.py#L110-L113](src/dashboard.py#L110-L113)).
+Ela pega o tipo pela routing key (`contagem`, `inicio` ou `leitor_fim`), entrega o conteúdo à
+interface por uma `queue.Queue` e confirma com ack.
